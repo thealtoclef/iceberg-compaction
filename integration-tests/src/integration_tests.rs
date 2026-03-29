@@ -17,11 +17,16 @@
 //! Integration tests that require Docker containers
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use iceberg::Catalog;
 use iceberg::spec::{PrimitiveType, Schema, UnboundPartitionSpec};
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
+use iceberg_compaction_core::cleanup::{
+    ExpireSnapshotsConfigBuilder, Maintenance, MaintenanceConfigBuilder, OrphanFileCleanup,
+    RemoveOrphanFilesConfigBuilder, SnapshotExpiration,
+};
 use iceberg_compaction_core::compaction::CompactionBuilder;
 use iceberg_compaction_core::config::{
     BinPackConfig, CompactionConfigBuilder, CompactionExecutionConfigBuilder,
@@ -552,6 +557,252 @@ async fn test_rolling_file_compaction_in_partitioned_files_with_min_files_in_gro
     );
 
     // Clean up: try to drop the table and namespace
+    let _ = catalog.drop_table(table.identifier()).await;
+    let _ = catalog.drop_namespace(table.identifier().namespace()).await;
+}
+
+#[tokio::test]
+async fn test_cleanup_expire_snapshots_dry_run() {
+    // Test snapshot expiration in dry-run mode
+    // Verifies that we can identify snapshots to expire without actually deleting them
+
+    let catalog = get_rest_catalog().await;
+    let catalog = Arc::new(catalog);
+
+    // Create a test table
+    let schema = TestSchemaBuilder::new()
+        .add_field("id", PrimitiveType::Long)
+        .add_field("data", PrimitiveType::String)
+        .build();
+
+    let table = setup_table(
+        catalog.clone(),
+        "cleanup_test",
+        "test_expire_snapshots",
+        &schema,
+        None,
+    )
+    .await;
+
+    // Run snapshot expiration in dry-run mode with very short retention
+    // This should identify snapshots to expire but not delete anything
+    let config = ExpireSnapshotsConfigBuilder::default()
+        .older_than(Duration::from_secs(0)) // Expire all old snapshots
+        .retain_last(1u32) // Keep at least 1 snapshot
+        .dry_run(true) // Dry run - don't actually delete
+        .build()
+        .unwrap();
+
+    let expiration = SnapshotExpiration::new(table.clone(), config);
+    let result = expiration.execute().await.unwrap();
+
+    // In dry-run mode, files should not be cleaned up
+    assert_eq!(
+        result.data_files_cleaned, 0,
+        "Dry run should not clean up any files"
+    );
+
+    // Clean up
+    let _ = catalog.drop_table(table.identifier()).await;
+    let _ = catalog.drop_namespace(table.identifier().namespace()).await;
+}
+
+#[tokio::test]
+async fn test_cleanup_orphan_files_dry_run() {
+    // Test orphan file cleanup in dry-run mode
+    // Verifies that the orphan cleanup logic runs without errors
+
+    let catalog = get_rest_catalog().await;
+    let catalog = Arc::new(catalog);
+
+    // Create a test table
+    let schema = TestSchemaBuilder::new()
+        .add_field("id", PrimitiveType::Long)
+        .add_field("data", PrimitiveType::String)
+        .build();
+
+    let table = setup_table(
+        catalog.clone(),
+        "cleanup_test",
+        "test_orphan_files",
+        &schema,
+        None,
+    )
+    .await;
+
+    // Run orphan cleanup in dry-run mode
+    let config = RemoveOrphanFilesConfigBuilder::default()
+        .older_than(Duration::from_secs(0))
+        .dry_run(true)
+        .build()
+        .unwrap();
+
+    let cleanup = OrphanFileCleanup::new(table.clone(), config);
+    let result = cleanup.execute().await.unwrap();
+
+    // In dry-run mode, files should not be deleted
+    assert_eq!(
+        result.files_deleted, 0,
+        "Dry run should not delete any files"
+    );
+
+    // Clean up
+    let _ = catalog.drop_table(table.identifier()).await;
+    let _ = catalog.drop_namespace(table.identifier().namespace()).await;
+}
+
+#[tokio::test]
+async fn test_cleanup_maintenance_combined() {
+    // Test combined maintenance workflow (expire snapshots + orphan cleanup)
+    // Verifies that both operations run in sequence
+
+    let catalog = get_rest_catalog().await;
+    let catalog = Arc::new(catalog);
+
+    // Create a test table
+    let schema = TestSchemaBuilder::new()
+        .add_field("id", PrimitiveType::Long)
+        .add_field("data", PrimitiveType::String)
+        .build();
+
+    let table = setup_table(
+        catalog.clone(),
+        "cleanup_test",
+        "test_maintenance",
+        &schema,
+        None,
+    )
+    .await;
+
+    // Run full maintenance in dry-run mode
+    let config = MaintenanceConfigBuilder::default()
+        .expire_snapshots(Some(
+            ExpireSnapshotsConfigBuilder::default()
+                .older_than(Duration::from_secs(0))
+                .retain_last(1u32)
+                .dry_run(true)
+                .build()
+                .unwrap(),
+        ))
+        .remove_orphans(Some(
+            RemoveOrphanFilesConfigBuilder::default()
+                .older_than(Duration::from_secs(0))
+                .dry_run(true)
+                .build()
+                .unwrap(),
+        ))
+        .build()
+        .unwrap();
+
+    let maintenance = Maintenance::new(table.clone(), config);
+    let result = maintenance.execute().await.unwrap();
+
+    // Verify both operations ran (even if dry-run)
+    assert!(
+        result.expire_result.is_some(),
+        "Maintenance should include expire result"
+    );
+    assert!(
+        result.orphan_result.is_some(),
+        "Maintenance should include orphan result"
+    );
+
+    // Clean up
+    let _ = catalog.drop_table(table.identifier()).await;
+    let _ = catalog.drop_namespace(table.identifier().namespace()).await;
+}
+
+#[tokio::test]
+async fn test_cleanup_maintenance_partial_expire_only() {
+    // Test maintenance with only snapshot expiration enabled
+    // Verifies that orphan cleanup is skipped when not configured
+
+    let catalog = get_rest_catalog().await;
+    let catalog = Arc::new(catalog);
+
+    // Create a test table
+    let schema = TestSchemaBuilder::new()
+        .add_field("id", PrimitiveType::Long)
+        .add_field("data", PrimitiveType::String)
+        .build();
+
+    let table = setup_table(
+        catalog.clone(),
+        "cleanup_test",
+        "test_maintenance_expire_only",
+        &schema,
+        None,
+    )
+    .await;
+
+    // Run maintenance with only expire_snapshots configured
+    let config = MaintenanceConfigBuilder::default()
+        .expire_snapshots(Some(
+            ExpireSnapshotsConfigBuilder::default()
+                .older_than(Duration::from_secs(0))
+                .retain_last(1u32)
+                .dry_run(true)
+                .build()
+                .unwrap(),
+        ))
+        .build()
+        .unwrap();
+
+    let maintenance = Maintenance::new(table.clone(), config);
+    let result = maintenance.execute().await.unwrap();
+
+    // Verify only expire ran
+    assert!(result.expire_result.is_some());
+    assert!(result.orphan_result.is_none());
+
+    // Clean up
+    let _ = catalog.drop_table(table.identifier()).await;
+    let _ = catalog.drop_namespace(table.identifier().namespace()).await;
+}
+
+#[tokio::test]
+async fn test_cleanup_maintenance_partial_orphan_only() {
+    // Test maintenance with only orphan cleanup enabled
+    // Verifies that snapshot expiration is skipped when not configured
+
+    let catalog = get_rest_catalog().await;
+    let catalog = Arc::new(catalog);
+
+    // Create a test table
+    let schema = TestSchemaBuilder::new()
+        .add_field("id", PrimitiveType::Long)
+        .add_field("data", PrimitiveType::String)
+        .build();
+
+    let table = setup_table(
+        catalog.clone(),
+        "cleanup_test",
+        "test_maintenance_orphan_only",
+        &schema,
+        None,
+    )
+    .await;
+
+    // Run maintenance with only remove_orphans configured
+    let config = MaintenanceConfigBuilder::default()
+        .remove_orphans(Some(
+            RemoveOrphanFilesConfigBuilder::default()
+                .older_than(Duration::from_secs(0))
+                .dry_run(true)
+                .build()
+                .unwrap(),
+        ))
+        .build()
+        .unwrap();
+
+    let maintenance = Maintenance::new(table.clone(), config);
+    let result = maintenance.execute().await.unwrap();
+
+    // Verify only orphan cleanup ran
+    assert!(result.expire_result.is_none());
+    assert!(result.orphan_result.is_some());
+
+    // Clean up
     let _ = catalog.drop_table(table.identifier()).await;
     let _ = catalog.drop_namespace(table.identifier().namespace()).await;
 }

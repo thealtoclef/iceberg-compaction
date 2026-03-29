@@ -4,6 +4,7 @@ members = [
     "core",
     "examples/memory-catalog",
     "examples/rest-catalog",
+    "examples/cleanup",
     "integration-tests",
 ]
 

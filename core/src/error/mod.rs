@@ -41,6 +41,12 @@ pub enum CompactionError {
 
     #[error("Compaction unexpected failed: {0}")]
     Unexpected(String),
+
+    #[error("Snapshot expiration failed: {0}")]
+    SnapshotExpiration(String),
+
+    #[error("Orphan file cleanup failed: {0}")]
+    OrphanCleanup(String),
 }
 
 pub type Result<T> = std::result::Result<T, CompactionError>;

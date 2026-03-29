@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+pub mod cleanup;
 pub mod common;
 pub mod compaction;
 pub mod config;
@@ -21,6 +22,12 @@ pub mod error;
 pub mod executor;
 pub mod file_selection;
 
+pub use cleanup::{
+    ExpireSnapshotsConfig, ExpireSnapshotsConfigBuilder, ExpireSnapshotsResult, Maintenance,
+    MaintenanceConfig, MaintenanceConfigBuilder, MaintenanceResult, OrphanFileCleanup,
+    RemoveOrphanFilesConfig, RemoveOrphanFilesConfigBuilder, RemoveOrphanFilesResult,
+    SnapshotExpiration,
+};
 pub use compaction::{AutoCompaction, AutoCompactionBuilder};
 pub use config::{AutoCompactionConfig, AutoThresholds, CompactionConfig};
 pub use error::{CompactionError, Result};

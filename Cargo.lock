@@ -1162,6 +1162,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "cleanup-example"
+version = "0.1.0"
+dependencies = [
+ "iceberg-compaction-core",
+ "tokio",
+]
+
+[[package]]
 name = "cmake"
 version = "0.1.57"
 source = "registry+https://github.com/rust-lang/crates.io-index"

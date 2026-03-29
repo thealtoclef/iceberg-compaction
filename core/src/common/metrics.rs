@@ -49,6 +49,14 @@ pub struct Metrics {
     // DataFusion distribution metrics
     pub compaction_datafusion_batch_row_count_dist: BoxedHistogramVec,
     pub compaction_datafusion_batch_bytes_dist: BoxedHistogramVec,
+
+    // Cleanup metrics
+    pub snapshot_expiration_counter: BoxedCounterVec,
+    pub snapshot_expiration_duration: BoxedHistogramVec,
+    pub snapshot_cleanup_files_counter: BoxedCounterVec,
+    pub orphan_cleanup_counter: BoxedCounterVec,
+    pub orphan_cleanup_duration: BoxedHistogramVec,
+    pub orphan_bytes_freed_counter: BoxedCounterVec,
 }
 
 impl Metrics {
@@ -218,6 +226,49 @@ impl Metrics {
             Buckets::exponential(1024.0 * 64.0, 2.0, 12), // 64KB, 128KB, 256KB, ..., 128MB
         );
 
+        // === Cleanup metrics registration ===
+        let snapshot_expiration_counter = registry.register_counter_vec(
+            "iceberg_compaction_snapshot_expiration_counter".into(),
+            "Number of snapshots expired during cleanup".into(),
+            &["catalog_name", "table_ident"],
+        );
+
+        let snapshot_expiration_duration = registry.register_histogram_vec_with_buckets(
+            "iceberg_compaction_snapshot_expiration_duration".into(),
+            "Duration of snapshot expiration operation in milliseconds".into(),
+            &["catalog_name", "table_ident"],
+            Buckets::exponential(
+                100.0, 4.0, 6, // 100ms, 400ms, 1.6s, 6.4s, 25.6s, 102.4s
+            ),
+        );
+
+        let snapshot_cleanup_files_counter = registry.register_counter_vec(
+            "iceberg_compaction_snapshot_cleanup_files_counter".into(),
+            "Number of files cleaned up during snapshot expiration".into(),
+            &["catalog_name", "table_ident"],
+        );
+
+        let orphan_cleanup_counter = registry.register_counter_vec(
+            "iceberg_compaction_orphan_cleanup_counter".into(),
+            "Number of orphan files cleaned up".into(),
+            &["catalog_name", "table_ident"],
+        );
+
+        let orphan_cleanup_duration = registry.register_histogram_vec_with_buckets(
+            "iceberg_compaction_orphan_cleanup_duration".into(),
+            "Duration of orphan file cleanup operation in milliseconds".into(),
+            &["catalog_name", "table_ident"],
+            Buckets::exponential(
+                100.0, 4.0, 6, // 100ms, 400ms, 1.6s, 6.4s, 25.6s, 102.4s
+            ),
+        );
+
+        let orphan_bytes_freed_counter = registry.register_counter_vec(
+            "iceberg_compaction_orphan_bytes_freed_counter".into(),
+            "Total bytes freed by orphan file cleanup".into(),
+            &["catalog_name", "table_ident"],
+        );
+
         Self {
             compaction_commit_counter,
             compaction_duration,
@@ -242,6 +293,14 @@ impl Metrics {
             compaction_datafusion_bytes_processed_total,
             compaction_datafusion_batch_row_count_dist,
             compaction_datafusion_batch_bytes_dist,
+
+            // Cleanup metrics
+            snapshot_expiration_counter,
+            snapshot_expiration_duration,
+            snapshot_cleanup_files_counter,
+            orphan_cleanup_counter,
+            orphan_cleanup_duration,
+            orphan_bytes_freed_counter,
         }
     }
 }
@@ -464,6 +523,89 @@ impl CompactionMetricsRecorder {
                 .compaction_datafusion_batch_bytes_dist
                 .histogram(&label_vec)
                 .record(batch_bytes as f64);
+        }
+    }
+}
+
+/// Helper for recording cleanup metrics
+#[derive(Clone)]
+pub struct CleanupMetricsRecorder {
+    metrics: Arc<Metrics>,
+    catalog_name: Cow<'static, str>,
+    table_ident: Cow<'static, str>,
+}
+
+impl CleanupMetricsRecorder {
+    pub fn new(
+        metrics: Arc<Metrics>,
+        catalog_name: impl Into<Cow<'static, str>>,
+        table_ident: impl Into<Cow<'static, str>>,
+    ) -> Self {
+        Self {
+            metrics,
+            catalog_name: catalog_name.into(),
+            table_ident: table_ident.into(),
+        }
+    }
+
+    fn label_vec(&self) -> [std::borrow::Cow<'static, str>; 2] {
+        [self.catalog_name.clone(), self.table_ident.clone()]
+    }
+
+    /// Record snapshot expiration metrics
+    pub fn record_snapshot_expiration(
+        &self,
+        duration_ms: f64,
+        snapshots_expired: usize,
+        files_cleaned: usize,
+    ) {
+        let label_vec = self.label_vec();
+
+        if snapshots_expired > 0 {
+            self.metrics
+                .snapshot_expiration_counter
+                .counter(&label_vec)
+                .increase(snapshots_expired as u64);
+        }
+
+        if files_cleaned > 0 {
+            self.metrics
+                .snapshot_cleanup_files_counter
+                .counter(&label_vec)
+                .increase(files_cleaned as u64);
+        }
+
+        if duration_ms > 0.0 && duration_ms.is_finite() {
+            self.metrics
+                .snapshot_expiration_duration
+                .histogram(&label_vec)
+                .record(duration_ms);
+        }
+    }
+
+    /// Record orphan cleanup metrics
+    pub fn record_orphan_cleanup(&self, duration_ms: f64, files_deleted: usize, bytes_freed: u64) {
+        let label_vec = self.label_vec();
+
+        if files_deleted > 0 {
+            self.metrics
+                .orphan_cleanup_counter
+                .counter(&label_vec)
+                .increase(files_deleted as u64);
+        }
+
+        if bytes_freed > 0 {
+            self.metrics
+                .orphan_bytes_freed_counter
+                .counter(&label_vec)
+                .increase(bytes_freed);
+        }
+
+        if duration_ms > 0.0 && duration_ms.is_finite() {
+            self.metrics
+                .orphan_cleanup_duration
+                .histogram(&label_vec)
+                .record(duration_ms);
         }
     }
 }
