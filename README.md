@@ -21,6 +21,73 @@
   - Positional deletions (POS_DELETE)
   - Equality deletions (EQ_DELETE)
 
+## 📝 Installation
+
+### CLI Tool
+
+```bash
+# Build from source
+cargo install --path core --bin iceberg-compaction
+
+# Or build release binary
+cargo build --release --bin iceberg-compaction
+```
+
+### Docker
+
+```bash
+# Build image
+docker build -t iceberg-compaction:latest .
+
+# Run
+docker run --rm iceberg-compaction:latest --help
+```
+
+## 🚀 Quick Start
+
+### Using the CLI
+
+```bash
+# 1. Create a configuration file (config.yaml)
+# See examples/docker-config/config.yaml for a template
+
+# 2. Validate configuration
+iceberg-compaction --config config.yaml validate
+
+# 3. Run compaction
+iceberg-compaction --config config.yaml compact --namespace prod --table events
+
+# 4. Run cleanup (expire snapshots + remove orphans)
+iceberg-compaction --config config.yaml cleanup --namespace prod --table events
+```
+
+### Using Docker Compose
+
+```bash
+# Start all services (MinIO, REST Catalog, compaction CLI)
+docker-compose -f docker-compose.example.yml up -d
+
+# Run compaction
+docker-compose -f docker-compose.example.yml exec compaction \
+  iceberg-compaction --config /config/config.yaml compact --table events
+
+# Run cleanup
+docker-compose -f docker-compose.example.yml exec compaction \
+  iceberg-compaction --config /config/config.yaml cleanup --table events
+```
+
+### As a Library
+
+```rust
+use iceberg_compaction_core::{CompactionBuilder, CompactionConfigBuilder};
+
+let compaction = CompactionBuilder::new(catalog, table_ident)
+    .with_config(Arc::new(CompactionConfigBuilder::default().build()?))
+    .build();
+
+let result = compaction.compact().await?;
+```
+
 ## 📝 Examples
 
 ### REST Catalog Example
@@ -57,6 +124,7 @@ See the [bench binary CLI reference](./docs/bench-cli.md) for benchmarking compa
 
 | Document | Description |
 |----------|-------------|
+| [**cli-reference.md**](./docs/cli-reference.md) | **CLI tool reference** - Installation, commands, options, examples |
 | [**USAGE.md**](./docs/USAGE.md) | Comprehensive usage guide - library usage, examples, CLI reference, configuration |
 | [**bench-cli.md**](./docs/bench-cli.md) | Detailed reference for the bench binary CLI |
 | [**cleanup-feature.md**](./docs/cleanup-feature.md) | Technical documentation for snapshot expiration and orphan cleanup |
@@ -90,11 +158,13 @@ See the [bench binary CLI reference](./docs/bench-cli.md) for benchmarking compa
 
 #### iceberg-rust
 
-- [ ] Expire snapshot
+- [x] Expire snapshot
+- [x] File clean: Delete orphan files
 - [ ] Rewrite manifest
 
 #### iceberg-compaction
 
+- [x] CLI tool for compaction and cleanup
+- [x] Docker support
 - [ ] Binpack/Sort/ZOrder Compaction
 - [ ] Clustering / Order by: Support for data reorganization and sorting
-- [ ] File clean: Delete orphan files

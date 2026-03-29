@@ -1,0 +1,55 @@
+# iceberg-compaction configuration example
+#
+# This configuration file demonstrates how to set up iceberg-compaction
+# for use with a REST catalog and S3-compatible storage (MinIO).
+#
+# Usage:
+#   iceberg-compaction --config config.yaml compact --namespace prod --table events
+#   iceberg-compaction --config config.yaml cleanup --namespace prod --table events
+
+# Catalog configurations
+catalogs:
+  - name: default
+    catalog_type: rest
+    uri: http://localhost:8181
+    warehouse: s3://iceberg-warehouse
+    storage:
+      endpoint: http://localhost:9000
+      region: us-east-1
+      access_key_id: minioadmin
+      secret_access_key: minioadmin
+
+  # Additional catalog example (uncomment to use)
+  # - name: production
+  #   catalog_type: rest
+  #   uri: https://catalog.example.com
+  #   warehouse: s3://prod-bucket/iceberg
+  #   storage:
+  #     region: us-west-2
+  #     access_key_id: ${AWS_ACCESS_KEY_ID}
+  #     secret_access_key: ${AWS_SECRET_ACCESS_KEY}
+
+# Default catalog to use when --catalog is not specified
+default_catalog: default
+
+# Default namespace (optional - can override with --namespace)
+# default_namespace: prod
+
+# Compaction settings (optional - defaults shown)
+compaction:
+  # Target file size in bytes (default: 512 MB)
+  target_file_size: 536870912
+
+  # Maximum number of input files per compaction task (default: 100)
+  max_input_files: 100
+
+# Cleanup settings (optional - defaults shown)
+cleanup:
+  # Expire snapshots older than this duration
+  older_than: 7d
+
+  # Minimum number of snapshots to retain
+  retain_last: 3
+
+  # Remove orphan files older than this duration
+  orphan_older_than: 7d

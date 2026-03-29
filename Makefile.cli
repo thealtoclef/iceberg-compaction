@@ -1,0 +1,47 @@
+.PHONY: build build-release cli test clean docker-build docker-run help
+
+# Default target
+all: build
+
+## Build the CLI binary
+build:
+	cargo build --bin iceberg-compaction
+
+## Build the CLI binary in release mode
+build-release:
+	cargo build --release --bin iceberg-compaction
+
+## Run the CLI with help
+cli:
+	cargo run --bin iceberg-compaction -- --help
+
+## Run tests
+test:
+	cargo test --lib
+
+## Clean build artifacts
+clean:
+	cargo clean
+
+## Build Docker image
+docker-build:
+	docker build -t iceberg-compaction:latest .
+
+## Run Docker container (interactive)
+docker-run:
+	docker run --rm -it iceberg-compaction:latest --help
+
+## Start docker-compose example
+compose-up:
+	docker-compose -f docker-compose.example.yml up -d
+
+## Stop docker-compose example
+compose-down:
+	docker-compose -f docker-compose.example.yml down
+
+## Show this help
+help:
+	@echo "iceberg-compaction Makefile"
+	@echo ""
+	@echo "Targets:"
+	@sed -n 's/^##//p' $(MAKEFILE_LIST) | column -t -s ':' |  sed -e 's/^/ /'

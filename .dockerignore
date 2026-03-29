@@ -1,0 +1,16 @@
+target/
+**/target/
+.git/
+.gitignore
+.github/
+*.md
+!README.md
+.pre-commit-config.yaml
+.pre-commit-config.yaml
+.typos.toml
+taplo.toml
+rust-toolchain.toml
+rustfmt.toml
+Makefile
+.dockerignore
+.gitignore
