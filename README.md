@@ -44,7 +44,22 @@ For more details, see the [rest-catalog example](./examples/rest-catalog/).
 
 ### Benchmark Tool
 
-See the [bench binary](./integration-tests/src/bin/README.md) for benchmarking compaction performance with mock data.
+See the [bench binary CLI reference](./docs/bench-cli.md) for benchmarking compaction performance with mock data.
+
+### Other Examples
+
+| Example | Description | Command |
+|---------|-------------|---------|
+| `memory-catalog` | In-memory catalog for testing | `cargo run -p iceberg-compaction-example-memory` |
+| `cleanup` | Snapshot expiration and orphan cleanup | `cargo run -p cleanup-example` |
+
+## 📚 Documentation
+
+| Document | Description |
+|----------|-------------|
+| [**USAGE.md**](./docs/USAGE.md) | Comprehensive usage guide - library usage, examples, CLI reference, configuration |
+| [**bench-cli.md**](./docs/bench-cli.md) | Detailed reference for the bench binary CLI |
+| [**cleanup-feature.md**](./docs/cleanup-feature.md) | Technical documentation for snapshot expiration and orphan cleanup |
 
 ## Development Roadmap
 

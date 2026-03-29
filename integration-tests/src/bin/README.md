@@ -1,12 +1,11 @@
-# Bench binary usage
+# Bench Binary Usage
 
 This binary (`bench`) lives under `integration-tests/src/bin/bench.rs`. It can:
 - Create an Iceberg table from a YAML config and write mock data
 - Run compaction on that table and print simple stats
 - Delete the table
 
-Default config path: `./testdata/mock_iceberg.yaml` (relative to the `integration-tests/` crate root).
-You need rest catalog if you want to run the tests.
+**For comprehensive documentation, see:** [docs/bench-cli.md](../../docs/bench-cli.md)
 
 ---
 
