@@ -7,9 +7,19 @@
 # - iceberg-compaction CLI
 #
 # Usage:
-#   docker-compose up -d                    # Start all services
-#   docker-compose exec compaction ...      # Run compaction commands
-#   docker-compose down                     # Stop all services
+#   # Start infrastructure (MinIO + REST Catalog)
+#   docker-compose -f docker-compose.example.yml up -d minio rest-catalog
+#
+#   # Run compaction (one-off container)
+#   docker-compose -f docker-compose.example.yml run --rm compaction \
+#     --config /config/config.yaml compact --namespace prod --table events
+#
+#   # Run cleanup
+#   docker-compose -f docker-compose.example.yml run --rm compaction \
+#     --config /config/config.yaml cleanup --namespace prod --table events
+#
+#   # Stop infrastructure
+#   docker-compose -f docker-compose.example.yml down
 
 services:
   # MinIO - S3-compatible object storage
@@ -65,6 +75,8 @@ services:
         condition: service_completed_successfully
 
   # iceberg-compaction CLI
+  # Note: This is a distroless image - run commands directly with 'run --rm'
+  # Distroless images don't have shells, so 'exec' won't work
   compaction:
     build:
       context: .
@@ -81,8 +93,8 @@ services:
     depends_on:
       - rest-catalog
       - minio
-    # Override entrypoint to keep container running for exec
-    entrypoint: ["tail", "-f", "/dev/null"]
+    # No entrypoint override - runs the binary directly
+    # Use 'docker-compose run --rm compaction <args>' to execute commands
 
 volumes:
   minio_data:
