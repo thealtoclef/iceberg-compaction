@@ -21,6 +21,7 @@ mixtrics = "0.2.0"
 parquet = { workspace = true }
 port_scanner = { workspace = true }
 rand = { workspace = true }
+serde = { version = "1.0", features = ["derive"] }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
