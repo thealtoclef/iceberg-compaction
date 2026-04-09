@@ -16,3 +16,4 @@ jobs:
       prerelease: ${{ github.ref_name == 'prerelease' }}
       publish: true
       directory: python/
+      maturin_pep517_args: --manylinux 2_28
