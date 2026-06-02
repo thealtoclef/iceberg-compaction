@@ -102,7 +102,7 @@ impl RecordBatchBuffer {
 #[derive(Debug)]
 pub(crate) struct IcebergFileTaskScan {
     file_scan_tasks_group: Vec<Vec<FileScanTask>>,
-    plan_properties: PlanProperties,
+    plan_properties: Arc<PlanProperties>,
     projection: Option<Vec<String>>,
     predicates: Option<Predicate>,
     file_io: FileIO,
@@ -156,8 +156,10 @@ impl IcebergFileTaskScan {
             file_scan_tasks
         };
         let file_scan_tasks_group = split_n_vecs(file_scan_tasks_projection, executor_parallelism);
-        let plan_properties =
-            Self::compute_properties(output_schema.clone(), file_scan_tasks_group.len());
+        let plan_properties = Arc::new(Self::compute_properties(
+            output_schema.clone(),
+            file_scan_tasks_group.len(),
+        ));
         let predicates = convert_filters_to_predicate(filters);
 
         Ok(Self {
@@ -277,7 +279,7 @@ impl ExecutionPlan for IcebergFileTaskScan {
         Ok(self)
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.plan_properties
     }
 
@@ -589,6 +591,7 @@ mod tests {
             partition: None,
             partition_spec: None,
             name_mapping: None,
+            referenced_data_file: None,
             case_sensitive: true,
         }
     }

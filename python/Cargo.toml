@@ -8,11 +8,11 @@ name = "_internal"
 crate-type = ["cdylib"]
 
 [dependencies]
+iceberg                  = { workspace = true }
+iceberg-catalog-glue     = { workspace = true }
+iceberg-catalog-hms      = { workspace = true }
+iceberg-catalog-rest     = { workspace = true }
+iceberg-catalog-s3tables = { workspace = true }
 iceberg-compaction-core  = { path = "../core" }
 pyo3                     = { version = "0.23", features = ["extension-module"] }
 tokio                    = { workspace = true, features = ["rt-multi-thread"] }
-iceberg                  = { workspace = true }
-iceberg-catalog-rest     = { workspace = true }
-iceberg-catalog-glue     = { workspace = true }
-iceberg-catalog-hms      = { workspace = true }
-iceberg-catalog-s3tables = { workspace = true }

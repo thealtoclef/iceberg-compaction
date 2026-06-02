@@ -980,6 +980,7 @@ mod tests {
                             partition: None,
                             partition_spec: None,
                             name_mapping: None,
+                            referenced_data_file: None,
                             case_sensitive: true,
                         })
                     })
@@ -1005,6 +1006,7 @@ mod tests {
                 partition: self.partition,
                 partition_spec: None,
                 name_mapping: None,
+                referenced_data_file: None,
                 case_sensitive: true,
             }
         }
@@ -1065,6 +1067,7 @@ mod tests {
                 partition: None,
                 partition_spec: None,
                 name_mapping: None,
+                referenced_data_file: None,
                 case_sensitive: true,
             })
         }
@@ -1855,6 +1858,7 @@ mod tests {
             partition: None,
             partition_spec: None,
             name_mapping: None,
+            referenced_data_file: None,
             case_sensitive: true,
         });
 
@@ -1875,6 +1879,7 @@ mod tests {
             partition: None,
             partition_spec: None,
             name_mapping: None,
+            referenced_data_file: None,
             case_sensitive: true,
         });
 
@@ -1895,6 +1900,7 @@ mod tests {
             partition: None,
             partition_spec: None,
             name_mapping: None,
+            referenced_data_file: None,
             case_sensitive: true,
         };
 
@@ -1945,6 +1951,7 @@ mod tests {
             partition: None,
             partition_spec: None,
             name_mapping: None,
+            referenced_data_file: None,
             case_sensitive: true,
         });
 
@@ -1965,6 +1972,7 @@ mod tests {
             partition: None,
             partition_spec: None,
             name_mapping: None,
+            referenced_data_file: None,
             case_sensitive: true,
         };
 
@@ -1985,6 +1993,7 @@ mod tests {
             partition: None,
             partition_spec: None,
             name_mapping: None,
+            referenced_data_file: None,
             case_sensitive: true,
         };
 
@@ -2039,6 +2048,7 @@ mod tests {
             partition: None,
             partition_spec: None,
             name_mapping: None,
+            referenced_data_file: None,
             case_sensitive: true,
         });
 
@@ -2059,6 +2069,7 @@ mod tests {
             partition: None,
             partition_spec: None,
             name_mapping: None,
+            referenced_data_file: None,
             case_sensitive: true,
         });
 
@@ -2079,6 +2090,7 @@ mod tests {
             partition: None,
             partition_spec: None,
             name_mapping: None,
+            referenced_data_file: None,
             case_sensitive: true,
         };
 
@@ -2099,6 +2111,7 @@ mod tests {
             partition: None,
             partition_spec: None,
             name_mapping: None,
+            referenced_data_file: None,
             case_sensitive: true,
         };
 
