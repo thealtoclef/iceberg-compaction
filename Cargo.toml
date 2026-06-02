@@ -22,19 +22,19 @@ datafusion = "53.0"
 
 # Local workspace members
 futures = "0.3.17"
-iceberg = { git = "https://github.com/thealtoclef/rw-iceberg-rust.git", branch = "devin/1780298857-upgrade-opendal-0.57", features = [
+iceberg = { git = "https://github.com/thealtoclef/rw-iceberg-rust.git", rev = "70ce9cc66391a535f28a437954814cb462e47f48", features = [
     "storage-s3",
     "storage-gcs",
     "storage-azblob",
     "storage-azdls",
 ] }
-iceberg-catalog-glue = { git = "https://github.com/thealtoclef/rw-iceberg-rust.git", branch = "devin/1780298857-upgrade-opendal-0.57" }
-iceberg-catalog-hms = { git = "https://github.com/thealtoclef/rw-iceberg-rust.git", branch = "devin/1780298857-upgrade-opendal-0.57" }
-iceberg-catalog-memory = { git = "https://github.com/thealtoclef/rw-iceberg-rust.git", branch = "devin/1780298857-upgrade-opendal-0.57" }
-iceberg-catalog-rest = { git = "https://github.com/thealtoclef/rw-iceberg-rust.git", branch = "devin/1780298857-upgrade-opendal-0.57" }
-iceberg-catalog-s3tables = { git = "https://github.com/thealtoclef/rw-iceberg-rust.git", branch = "devin/1780298857-upgrade-opendal-0.57" }
+iceberg-catalog-glue = { git = "https://github.com/thealtoclef/rw-iceberg-rust.git", rev = "70ce9cc66391a535f28a437954814cb462e47f48" }
+iceberg-catalog-hms = { git = "https://github.com/thealtoclef/rw-iceberg-rust.git", rev = "70ce9cc66391a535f28a437954814cb462e47f48" }
+iceberg-catalog-memory = { git = "https://github.com/thealtoclef/rw-iceberg-rust.git", rev = "70ce9cc66391a535f28a437954814cb462e47f48" }
+iceberg-catalog-rest = { git = "https://github.com/thealtoclef/rw-iceberg-rust.git", rev = "70ce9cc66391a535f28a437954814cb462e47f48" }
+iceberg-catalog-s3tables = { git = "https://github.com/thealtoclef/rw-iceberg-rust.git", rev = "70ce9cc66391a535f28a437954814cb462e47f48" }
 iceberg-compaction-core = { path = "./core" }
-iceberg-datafusion = { git = "https://github.com/thealtoclef/rw-iceberg-rust.git", branch = "devin/1780298857-upgrade-opendal-0.57" }
+iceberg-datafusion = { git = "https://github.com/thealtoclef/rw-iceberg-rust.git", rev = "70ce9cc66391a535f28a437954814cb462e47f48" }
 
 parquet = { version = "58", features = ["async"] }
 port_scanner = "0.1.5"
