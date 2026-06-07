@@ -2,6 +2,8 @@
 resolver = "2"
 members = [
     "core",
+    "python",
+    "examples/biglake-metastore-rest-catalog",
     "examples/memory-catalog",
     "examples/rest-catalog",
     "integration-tests",
@@ -11,6 +13,8 @@ members = [
 # Async runtime and utilities
 async-stream = "0.3.5"
 async-trait = "0.1.89"
+gcp_auth = "0.12"
+rustls = { version = "0.23", features = ["aws-lc-rs"] }
 
 # Data processing and storage
 ctor = "0.2.8"
