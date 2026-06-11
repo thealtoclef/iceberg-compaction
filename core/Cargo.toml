@@ -8,6 +8,7 @@ async-stream = { workspace = true }
 async-trait = { workspace = true }
 backon = "1.2.0"
 ctor = { workspace = true }
+dashmap = { workspace = true }
 datafusion = { workspace = true }
 derive_builder = "0.20"
 futures = { workspace = true }

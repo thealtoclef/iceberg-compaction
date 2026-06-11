@@ -2824,7 +2824,7 @@ dependencies = [
 [[package]]
 name = "iceberg"
 version = "0.8.0"
-source = "git+https://github.com/thealtoclef/rw-iceberg-rust.git?rev=0f623de851e68d50eca71d6b0afe5ad3c00c6a59#0f623de851e68d50eca71d6b0afe5ad3c00c6a59"
+source = "git+https://github.com/thealtoclef/rw-iceberg-rust.git?rev=3bde28801215f3fcec0e0be1a28524d1f6021a4f#3bde28801215f3fcec0e0be1a28524d1f6021a4f"
 dependencies = [
  "anyhow",
  "apache-avro",
@@ -2883,7 +2883,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-glue"
 version = "0.8.0"
-source = "git+https://github.com/thealtoclef/rw-iceberg-rust.git?rev=0f623de851e68d50eca71d6b0afe5ad3c00c6a59#0f623de851e68d50eca71d6b0afe5ad3c00c6a59"
+source = "git+https://github.com/thealtoclef/rw-iceberg-rust.git?rev=3bde28801215f3fcec0e0be1a28524d1f6021a4f#3bde28801215f3fcec0e0be1a28524d1f6021a4f"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2898,7 +2898,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-rest"
 version = "0.8.0"
-source = "git+https://github.com/thealtoclef/rw-iceberg-rust.git?rev=0f623de851e68d50eca71d6b0afe5ad3c00c6a59#0f623de851e68d50eca71d6b0afe5ad3c00c6a59"
+source = "git+https://github.com/thealtoclef/rw-iceberg-rust.git?rev=3bde28801215f3fcec0e0be1a28524d1f6021a4f#3bde28801215f3fcec0e0be1a28524d1f6021a4f"
 dependencies = [
  "async-trait",
  "base64",
@@ -2925,6 +2925,7 @@ dependencies = [
  "async-trait",
  "backon",
  "ctor",
+ "dashmap",
  "datafusion",
  "derive_builder",
  "futures",
@@ -2984,7 +2985,7 @@ dependencies = [
 [[package]]
 name = "iceberg-datafusion"
 version = "0.8.0"
-source = "git+https://github.com/thealtoclef/rw-iceberg-rust.git?rev=0f623de851e68d50eca71d6b0afe5ad3c00c6a59#0f623de851e68d50eca71d6b0afe5ad3c00c6a59"
+source = "git+https://github.com/thealtoclef/rw-iceberg-rust.git?rev=3bde28801215f3fcec0e0be1a28524d1f6021a4f#3bde28801215f3fcec0e0be1a28524d1f6021a4f"
 dependencies = [
  "anyhow",
  "async-trait",

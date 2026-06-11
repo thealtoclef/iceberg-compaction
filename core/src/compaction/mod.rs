@@ -16,18 +16,20 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use backon::{ExponentialBuilder, Retryable};
+use dashmap::DashMap;
 use iceberg::io::FileIO;
-use iceberg::spec::{DataFile, MAIN_BRANCH, Snapshot, UNASSIGNED_SNAPSHOT_ID};
+use iceberg::spec::{DataContentType, DataFile, MAIN_BRANCH, Snapshot, UNASSIGNED_SNAPSHOT_ID};
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::writer::file_writer::location_generator::DefaultLocationGenerator;
 use iceberg::{Catalog, ErrorKind, TableIdent};
 use mixtrics::metrics::BoxedRegistry;
 use mixtrics::registry::noop::NoopMetricsRegistry;
+use tokio::sync::Mutex as AsyncMutex;
 
 use crate::common::{CompactionMetricsRecorder, Metrics};
 use crate::compaction::validator::CompactionValidator;
@@ -46,6 +48,21 @@ pub use auto::{
     AutoCompaction, AutoCompactionBuilder, AutoCompactionPlanner, AutoPlanReason, AutoPlanReport,
     AutoSelectedStrategy,
 };
+
+/// Per-table async mutex to serialize commits per table+branch.
+/// Uses sharded `DashMap` to avoid blocking the tokio runtime thread.
+///
+/// Keyed by `"{table_ident}@{branch}"`.
+static COMMIT_LOCKS: LazyLock<DashMap<String, Arc<AsyncMutex<()>>>> =
+    LazyLock::new(DashMap::new);
+
+fn get_commit_mutex(table_ident: &TableIdent, to_branch: &str) -> Arc<AsyncMutex<()>> {
+    let key = format!("{table_ident}@{to_branch}");
+    COMMIT_LOCKS
+        .entry(key)
+        .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+        .clone()
+}
 
 /// Validates that all rewrite results target the same snapshot and branch.
 ///
@@ -75,6 +92,54 @@ fn validate_rewrite_results_consistency(
     Ok(())
 }
 
+/// Re-validates that no new position delete files targeting the input data files
+/// have been committed since `starting_snapshot_id`. If a conflict is found, returns
+/// `PreconditionFailed` to abort the retry loop and trigger re-planning.
+async fn validate_no_new_pos_deletes_for_input_files(
+    table: &Table,
+    starting_snapshot_id: i64,
+    to_branch: &str,
+    input_data_files: &[DataFile],
+) -> std::result::Result<(), iceberg::Error> {
+    let Some(current) = table.metadata().snapshot_for_ref(to_branch) else {
+        return Ok(());
+    };
+    if current.snapshot_id() == starting_snapshot_id {
+        return Ok(());
+    }
+
+    let input_paths: std::collections::HashSet<&str> =
+        input_data_files.iter().map(|f| f.file_path()).collect();
+
+    let manifest_list = current
+        .load_manifest_list(table.file_io(), table.metadata())
+        .await?;
+
+    for mf in manifest_list.entries() {
+        let manifest = mf.load_manifest(table.file_io()).await?;
+        let (entries, _) = manifest.into_parts();
+
+        for entry in entries {
+            if entry.content_type() != DataContentType::PositionDeletes {
+                continue;
+            }
+            let df = entry.data_file();
+            if let Some(ref_path) = df.referenced_data_file() {
+                if input_paths.contains(ref_path.as_str()) {
+                    return Err(iceberg::Error::new(
+                        ErrorKind::PreconditionFailed,
+                        format!(
+                            "Cannot commit: new position delete references input file {}",
+                            ref_path
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Builder for `Compaction` with optional configuration.
 ///
 /// # Examples
@@ -88,13 +153,13 @@ fn validate_rewrite_results_consistency(
 pub struct CompactionBuilder {
     catalog: Arc<dyn Catalog>,
     table_ident: TableIdent,
-
     catalog_name: Option<Cow<'static, str>>,
     config: Option<Arc<CompactionConfig>>,
     executor_type: Option<ExecutorType>,
     registry: Option<BoxedRegistry>,
     commit_retry_config: Option<CommitManagerRetryConfig>,
     to_branch: Option<Cow<'static, str>>,
+    remove_dangling_deletes: bool,
 }
 
 impl CompactionBuilder {
@@ -110,6 +175,7 @@ impl CompactionBuilder {
             registry: None,
             commit_retry_config: None,
             to_branch: None,
+            remove_dangling_deletes: false,
         }
     }
 
@@ -149,6 +215,12 @@ impl CompactionBuilder {
         self
     }
 
+    /// Enables removal of dangling delete files after compaction.
+    pub fn with_remove_dangling_deletes(mut self) -> Self {
+        self.remove_dangling_deletes = true;
+        self
+    }
+
     /// Builds the `Compaction` instance with configured values.
     pub fn build(self) -> Compaction {
         let executor_type = self.executor_type.unwrap_or(ExecutorType::DataFusion);
@@ -182,6 +254,7 @@ impl CompactionBuilder {
             catalog_name,
             commit_retry_config,
             to_branch,
+            remove_dangling_deletes: self.remove_dangling_deletes,
         }
     }
 }
@@ -209,9 +282,9 @@ pub struct Compaction {
     pub table_ident: TableIdent,
     pub table_ident_name: Cow<'static, str>,
     pub catalog_name: Cow<'static, str>,
-
     pub commit_retry_config: CommitManagerRetryConfig,
     pub to_branch: Cow<'static, str>,
+    pub remove_dangling_deletes: bool,
 }
 
 /// Intermediate result from `rewrite_plan()` before commit.
@@ -260,7 +333,6 @@ impl Compaction {
         if let Some(config) = &self.config {
             let overall_start_time = std::time::Instant::now();
 
-            // 1. Get all compaction plans
             let plans = self.plan_compaction().await?;
 
             if plans.is_empty() {
@@ -269,7 +341,6 @@ impl Compaction {
 
             let table = self.catalog.load_table(&self.table_ident).await?;
 
-            // 2. Concurrently execute rewrite for all plans
             let rewrite_results = self
                 .concurrent_rewrite_plans(plans, &config.execution, &table)
                 .await?;
@@ -278,20 +349,33 @@ impl Compaction {
                 return Ok(None);
             }
 
-            // 3. Commit all rewrite results in a single transaction
             let commit_start_time = std::time::Instant::now();
             let final_table = self.commit_rewrite_results(rewrite_results.clone()).await?;
 
-            // 4. Run validations if enabled
+            if self.remove_dangling_deletes {
+                let removed = iceberg::actions::RemoveDanglingDeleteFilesAction::new(
+                    self.catalog.clone(),
+                    self.table_ident.clone(),
+                )
+                .to_branch(self.to_branch.as_ref())
+                .execute()
+                .await?;
+                if removed > 0 {
+                    tracing::info!(
+                        removed = removed,
+                        table = %self.table_ident,
+                        "Removed dangling delete files after compaction"
+                    );
+                }
+            }
+
             if config.execution.enable_validate_compaction {
                 self.run_validations(rewrite_results.clone(), &final_table)
                     .await?;
             }
 
-            // 6. Update metrics for the entire compaction operation
             self.record_overall_metrics(&rewrite_results, overall_start_time, commit_start_time);
 
-            // 7. Merge results for response
             let merged_result =
                 self.merge_rewrite_results_to_compaction_result(rewrite_results, Some(final_table));
             Ok(Some(merged_result))
@@ -664,6 +748,23 @@ impl Compaction {
             .commit_rewrite_results(vec![rewrite_result.clone()])
             .await?;
 
+        if self.remove_dangling_deletes {
+            let removed = iceberg::actions::RemoveDanglingDeleteFilesAction::new(
+                self.catalog.clone(),
+                self.table_ident.clone(),
+            )
+            .to_branch(self.to_branch.as_ref())
+            .execute()
+            .await?;
+            if removed > 0 {
+                tracing::info!(
+                    removed = removed,
+                    table = %self.table_ident,
+                    "Removed dangling delete files after compaction"
+                );
+            }
+        }
+
         // Run validation if enabled
         if execution_config.enable_validate_compaction
             && let Some(validation_info) = &rewrite_result.validation_info
@@ -774,7 +875,7 @@ pub struct CommitManagerRetryConfig {
 impl Default for CommitManagerRetryConfig {
     fn default() -> Self {
         Self {
-            max_retries: 3,
+            max_retries: 5,
             retry_initial_delay: Duration::from_secs(1),
             retry_max_delay: Duration::from_secs(10),
         }
@@ -877,16 +978,16 @@ impl CommitManager {
         // --- Batch collect input files from all plans ---
         use std::collections::HashMap;
 
-        // 1. Load all files from snapshot once
-        let (all_data_files, _all_delete_files) =
+        let (all_data_files, all_delete_files) =
             get_all_files_from_snapshot(snapshot, table.file_io(), table.metadata()).await?;
 
-        // 2. Build efficient path -> DataFile index (only for data files)
         let data_file_index: HashMap<&str, &DataFile> =
             all_data_files.iter().map(|f| (f.file_path(), f)).collect();
+        let delete_file_index: HashMap<&str, &DataFile> = all_delete_files
+            .iter()
+            .map(|f| (f.file_path(), f))
+            .collect();
 
-        // 3. Collect rewritten data files (to be replaced) from plans using the index
-        // Note: Only data files are collected, delete files are excluded
         let rewritten_data_files: Vec<DataFile> = rewrite_results
             .iter()
             .flat_map(|rr| {
@@ -899,13 +1000,37 @@ impl CommitManager {
             .filter_map(|path| data_file_index.get(path).map(|&f| f.clone()))
             .collect();
 
-        // 4. Collect added data files (newly written) from all plans
+        // Collect position deletes only. Equality deletes are excluded because
+        // in V2 they apply to all data files with lower sequence numbers in the
+        // partition — removing them without verifying all such files are rewritten
+        // is unsafe.
+        let rewritten_delete_file_paths: std::collections::HashSet<&str> = rewrite_results
+            .iter()
+            .flat_map(|rr| {
+                rr.plan
+                    .file_group
+                    .position_delete_files
+                    .iter()
+                    .map(|task| task.data_file_path.as_str())
+            })
+            .collect();
+
+        let rewritten_delete_files: Vec<DataFile> = rewritten_delete_file_paths
+            .iter()
+            .filter_map(|path| delete_file_index.get(path).map(|&f| f.clone()))
+            .collect();
+
         let added_data_files: Vec<DataFile> = rewrite_results
             .iter()
             .flat_map(|rr| rr.output_data_files.iter().cloned())
             .collect();
 
-        Ok((added_data_files, rewritten_data_files))
+        let all_rewritten_files: Vec<DataFile> = rewritten_data_files
+            .into_iter()
+            .chain(rewritten_delete_files)
+            .collect();
+
+        Ok((added_data_files, all_rewritten_files))
     }
 
     /// Rewrites files from results: file collection, validation, and commit.
@@ -955,6 +1080,7 @@ impl CommitManager {
     ) -> Result<Table> {
         let data_files = added_data_files;
         let delete_files = rewritten_data_files;
+        let to_branch = to_branch.to_owned();
 
         let operation = || {
             let catalog = self.catalog.clone();
@@ -964,8 +1090,13 @@ impl CommitManager {
             let use_starting_sequence_number = self.use_starting_sequence_number;
             let starting_snapshot_id = self.starting_snapshot_id;
             let metrics_recorder = self.metrics_recorder.clone();
+            let to_branch = to_branch.clone();
 
             async move {
+                // Serialize commits: only one plan commits per table+branch at a time.
+                let commit_mutex = get_commit_mutex(&table_ident, &to_branch);
+                let _commit_guard = commit_mutex.lock().await;
+
                 // reload the table to get the latest state
                 let table = catalog.load_table(&table_ident).await?;
 
@@ -981,6 +1112,8 @@ impl CommitManager {
                 }
 
                 let txn = Transaction::new(&table);
+
+                let delete_files_for_reval = delete_files.clone();
 
                 // TODO: support validation of data files and delete files with starting snapshot before applying the rewrite
                 let rewrite_action = if use_starting_sequence_number {
@@ -1012,7 +1145,7 @@ impl CommitManager {
                         .delete_files(delete_files)
                         .set_target_branch(to_branch.to_owned())
                         .set_check_file_existence(true);
-                    if let Some(snapshot) = table.metadata().snapshot_for_ref(to_branch) {
+                    if let Some(snapshot) = table.metadata().snapshot_for_ref(&to_branch) {
                         action.set_snapshot_properties(custom_snapshot_properties(snapshot));
                     }
                     action
@@ -1033,6 +1166,15 @@ impl CommitManager {
                             table_ident,
                             commit_err
                         );
+                        if commit_err.kind() == ErrorKind::CatalogCommitConflicts {
+                            validate_no_new_pos_deletes_for_input_files(
+                                &table,
+                                starting_snapshot_id,
+                                &to_branch,
+                                &delete_files_for_reval,
+                            )
+                            .await?;
+                        }
                         Err(commit_err)
                     }
                 }
@@ -1042,7 +1184,8 @@ impl CommitManager {
         let retry_strategy = ExponentialBuilder::default()
             .with_min_delay(self.config.retry_initial_delay)
             .with_max_delay(self.config.retry_max_delay)
-            .with_max_times(self.config.max_retries as usize);
+            .with_max_times(self.config.max_retries as usize)
+            .with_jitter();
 
         operation
             .retry(retry_strategy)
@@ -1073,6 +1216,7 @@ impl CommitManager {
     ) -> Result<Table> {
         let data_files = added_data_files;
         let delete_files = rewritten_data_files;
+        let to_branch = to_branch.to_owned();
 
         let operation = || {
             let catalog = self.catalog.clone();
@@ -1082,8 +1226,13 @@ impl CommitManager {
             let use_starting_sequence_number = self.use_starting_sequence_number;
             let starting_snapshot_id = self.starting_snapshot_id;
             let metrics_recorder = self.metrics_recorder.clone();
+            let to_branch = to_branch.clone();
 
             async move {
+                // Serialize commits per table to prevent lockstep collision.
+                let commit_mutex = get_commit_mutex(&table_ident, &to_branch);
+                let _commit_guard = commit_mutex.lock().await;
+
                 // reload the table to get the latest state
                 let table = catalog.load_table(&table_ident).await?;
 
@@ -1099,6 +1248,8 @@ impl CommitManager {
                 }
 
                 let txn = Transaction::new(&table);
+
+                let delete_files_for_reval = delete_files.clone();
 
                 // TODO: support validation of data files and delete files with starting snapshot before applying the rewrite
                 let overwrite_action = if use_starting_sequence_number {
@@ -1128,7 +1279,7 @@ impl CommitManager {
                         .delete_files(delete_files)
                         .set_target_branch(to_branch.to_owned())
                         .set_check_file_existence(true);
-                    if let Some(snapshot) = table.metadata().snapshot_for_ref(to_branch) {
+                    if let Some(snapshot) = table.metadata().snapshot_for_ref(&to_branch) {
                         action.set_snapshot_properties(custom_snapshot_properties(snapshot));
                     }
                     action
@@ -1149,6 +1300,15 @@ impl CommitManager {
                             table_ident,
                             commit_err
                         );
+                        if commit_err.kind() == ErrorKind::CatalogCommitConflicts {
+                            validate_no_new_pos_deletes_for_input_files(
+                                &table,
+                                starting_snapshot_id,
+                                &to_branch,
+                                &delete_files_for_reval,
+                            )
+                            .await?;
+                        }
                         Err(commit_err)
                     }
                 }
@@ -1158,7 +1318,8 @@ impl CommitManager {
         let retry_strategy = ExponentialBuilder::default()
             .with_min_delay(self.config.retry_initial_delay)
             .with_max_delay(self.config.retry_max_delay)
-            .with_max_times(self.config.max_retries as usize);
+            .with_max_times(self.config.max_retries as usize)
+            .with_jitter();
 
         operation
             .retry(retry_strategy)
@@ -1366,7 +1527,8 @@ mod tests {
     use iceberg::arrow::schema_to_arrow_schema;
     use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalog, MemoryCatalogBuilder};
     use iceberg::spec::{
-        DataFile, MAIN_BRANCH, NestedField, PrimitiveType, Schema, Type, UNASSIGNED_SNAPSHOT_ID,
+        DataFile, DataFileBuilder, MAIN_BRANCH, NestedField, PrimitiveType, Schema, Type,
+        UNASSIGNED_SNAPSHOT_ID,
     };
     use iceberg::table::Table;
     use iceberg::transaction::{ApplyTransactionAction, Transaction};
