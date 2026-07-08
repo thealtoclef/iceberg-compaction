@@ -51,7 +51,9 @@ impl AutoSelectedStrategy {
             crate::config::CompactionPlanningConfig::SmallFiles(_) => {
                 Some(AutoSelectedStrategy::SmallFiles)
             }
-            crate::config::CompactionPlanningConfig::Full(_) => None,
+            // Not yet produced by auto strategy selection; only reachable via explicit config.
+            crate::config::CompactionPlanningConfig::Full(_)
+            | crate::config::CompactionPlanningConfig::SmallFilesWithDelete(_) => None,
         }
     }
 }

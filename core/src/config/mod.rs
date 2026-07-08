@@ -276,6 +276,21 @@ pub struct FilesWithDeletesConfig {
     #[builder(default = "DEFAULT_MIN_DELETE_FILE_COUNT_THRESHOLD")]
     pub min_delete_file_count_threshold: usize,
 
+    /// Minimum approximate deleted row count required to trigger compaction.
+    ///
+    /// This is an approximation computed from manifest metadata only (no file
+    /// content is read), mirroring Apache Iceberg's `tooHighDeleteRatio()`: it
+    /// sums `record_count` over deletion-vector/file-scoped position deletes
+    /// only, clamped to the data file's own record count. Equality deletes and
+    /// partition-scoped position deletes are excluded, since their exact
+    /// row-level impact cannot be determined without reading file content.
+    ///
+    /// Combined with `min_delete_file_count_threshold` via logical OR — a file
+    /// is selected if either threshold is met. `None` or `Some(0)` disables
+    /// this check.
+    #[builder(default, setter(strip_option))]
+    pub min_delete_row_count_threshold: Option<u64>,
+
     /// Optional filters to apply after grouping.
     ///
     /// Groups that don't meet these criteria will be excluded from compaction.
@@ -288,6 +303,81 @@ impl Default for FilesWithDeletesConfig {
         FilesWithDeletesConfigBuilder::default()
             .build()
             .expect("FilesWithDeletesConfig default should always build")
+    }
+}
+
+/// Configuration for the combined small-files-with-delete compaction strategy.
+///
+/// This strategy selects a data file if it matches *either* the small-files
+/// predicate (size below `small_file_threshold_bytes`) *or* the
+/// files-with-deletes predicate (delete file count at or above
+/// `min_delete_file_count_threshold`). It supports group filtering to control
+/// which groups get compacted.
+#[derive(Debug, Clone, Builder)]
+#[builder(setter(into))]
+pub struct SmallFilesWithDeleteConfig {
+    #[builder(default = "DEFAULT_TARGET_FILE_SIZE")]
+    pub target_file_size_bytes: u64,
+
+    #[builder(default = "DEFAULT_MIN_SIZE_PER_PARTITION")]
+    pub min_size_per_partition: u64,
+
+    #[builder(default = "DEFAULT_MAX_FILE_COUNT_PER_PARTITION")]
+    pub max_file_count_per_partition: usize,
+
+    /// Maximum parallelism for input (reading) operations.
+    /// Defaults to 4x available CPU parallelism.
+    #[builder(default = "available_parallelism().get() * 4")]
+    pub max_input_parallelism: usize,
+
+    /// Maximum parallelism for output (writing) operations.
+    /// Defaults to available CPU parallelism.
+    #[builder(default = "available_parallelism().get()")]
+    pub max_output_parallelism: usize,
+
+    #[builder(default = "true")]
+    pub enable_heuristic_output_parallelism: bool,
+
+    #[builder(default = "DEFAULT_SMALL_FILE_THRESHOLD")]
+    pub small_file_threshold_bytes: u64,
+
+    /// Minimum number of delete files required to select a file via the
+    /// files-with-deletes predicate.
+    #[builder(default = "DEFAULT_MIN_DELETE_FILE_COUNT_THRESHOLD")]
+    pub min_delete_file_count_threshold: usize,
+
+    /// Minimum approximate deleted row count required to select a file via
+    /// the files-with-deletes predicate.
+    ///
+    /// See `FilesWithDeletesConfig::min_delete_row_count_threshold` for how
+    /// this is approximated. Combined with the size and delete-file-count
+    /// predicates via logical OR. `None` or `Some(0)` disables this check.
+    #[builder(default, setter(strip_option))]
+    pub min_delete_row_count_threshold: Option<u64>,
+
+    /// How to group files before compaction.
+    #[builder(default)]
+    pub grouping_strategy: GroupingStrategy,
+
+    /// Boundary for file groups before applying `grouping_strategy`.
+    ///
+    /// With [`FileGroupScope::Table`], `group_filters` evaluate groups across
+    /// all selected partitions instead of independently per partition.
+    #[builder(default)]
+    pub file_group_scope: FileGroupScope,
+
+    /// Optional filters to apply after grouping.
+    ///
+    /// Groups that don't meet these criteria will be excluded from compaction.
+    #[builder(default, setter(strip_option))]
+    pub group_filters: Option<GroupFilters>,
+}
+
+impl Default for SmallFilesWithDeleteConfig {
+    fn default() -> Self {
+        SmallFilesWithDeleteConfigBuilder::default()
+            .build()
+            .expect("SmallFilesWithDeleteConfig default should always build")
     }
 }
 
@@ -308,6 +398,7 @@ pub enum CompactionPlanningConfig {
     SmallFiles(SmallFilesConfig),
     Full(FullCompactionConfig),
     FilesWithDeletes(FilesWithDeletesConfig),
+    SmallFilesWithDelete(SmallFilesWithDeleteConfig),
 }
 
 impl CompactionPlanningConfig {
@@ -317,6 +408,7 @@ impl CompactionPlanningConfig {
             Self::SmallFiles(c) => c.target_file_size_bytes,
             Self::Full(c) => c.target_file_size_bytes,
             Self::FilesWithDeletes(c) => c.target_file_size_bytes,
+            Self::SmallFilesWithDelete(c) => c.target_file_size_bytes,
         }
     }
 
@@ -326,6 +418,7 @@ impl CompactionPlanningConfig {
             Self::SmallFiles(c) => c.min_size_per_partition,
             Self::Full(c) => c.min_size_per_partition,
             Self::FilesWithDeletes(c) => c.min_size_per_partition,
+            Self::SmallFilesWithDelete(c) => c.min_size_per_partition,
         }
     }
 
@@ -335,6 +428,7 @@ impl CompactionPlanningConfig {
             Self::SmallFiles(c) => c.max_file_count_per_partition,
             Self::Full(c) => c.max_file_count_per_partition,
             Self::FilesWithDeletes(c) => c.max_file_count_per_partition,
+            Self::SmallFilesWithDelete(c) => c.max_file_count_per_partition,
         }
     }
 
@@ -344,6 +438,7 @@ impl CompactionPlanningConfig {
             Self::SmallFiles(c) => c.max_input_parallelism,
             Self::Full(c) => c.max_input_parallelism,
             Self::FilesWithDeletes(c) => c.max_input_parallelism,
+            Self::SmallFilesWithDelete(c) => c.max_input_parallelism,
         }
     }
 
@@ -353,6 +448,7 @@ impl CompactionPlanningConfig {
             Self::SmallFiles(c) => c.max_output_parallelism,
             Self::Full(c) => c.max_output_parallelism,
             Self::FilesWithDeletes(c) => c.max_output_parallelism,
+            Self::SmallFilesWithDelete(c) => c.max_output_parallelism,
         }
     }
 
@@ -362,6 +458,7 @@ impl CompactionPlanningConfig {
             Self::SmallFiles(c) => c.enable_heuristic_output_parallelism,
             Self::Full(c) => c.enable_heuristic_output_parallelism,
             Self::FilesWithDeletes(c) => c.enable_heuristic_output_parallelism,
+            Self::SmallFilesWithDelete(c) => c.enable_heuristic_output_parallelism,
         }
     }
 
@@ -371,6 +468,7 @@ impl CompactionPlanningConfig {
             Self::SmallFiles(c) => c.file_group_scope,
             Self::Full(c) => c.file_group_scope,
             Self::FilesWithDeletes(c) => c.file_group_scope,
+            Self::SmallFilesWithDelete(c) => c.file_group_scope,
         }
     }
 }
@@ -583,6 +681,11 @@ pub struct AutoCompactionConfig {
     #[builder(default = "DEFAULT_MIN_DELETE_FILE_COUNT_THRESHOLD")]
     pub min_delete_file_count_threshold: usize,
 
+    /// See `FilesWithDeletesConfig::min_delete_row_count_threshold`. `None`
+    /// (default) disables this check for auto-selected candidates.
+    #[builder(default, setter(strip_option))]
+    pub min_delete_row_count_threshold: Option<u64>,
+
     /// Maximum number of compaction plans to execute per auto-compaction run.
     /// Defaults to unlimited.
     #[builder(default = "DEFAULT_MAX_AUTO_PLANS_PER_RUN")]
@@ -619,6 +722,7 @@ impl AutoCompactionConfig {
                     grouping_strategy: self.grouping_strategy.clone(),
                     file_group_scope: FileGroupScope::Partition,
                     min_delete_file_count_threshold: self.min_delete_file_count_threshold,
+                    min_delete_row_count_threshold: self.min_delete_row_count_threshold,
                     group_filters: self.group_filters.clone(),
                 },
             ))
