@@ -147,7 +147,7 @@ impl AutoCompactionPlanner {
             tasks.as_ref().unwrap(),
             self.config.small_file_threshold_bytes,
             self.config.min_delete_file_count_threshold,
-            self.config.min_position_delete_row_count_threshold,
+            self.config.min_position_delete_record_count_threshold,
             self.config.min_equality_delete_record_count_threshold,
         );
 
@@ -311,11 +311,11 @@ impl AutoCompactionPlanner {
         tasks: &[FileScanTask],
         small_file_threshold_bytes: u64,
         min_delete_file_count_threshold: usize,
-        min_position_delete_row_count_threshold: Option<u64>,
+        min_position_delete_record_count_threshold: Option<u64>,
         min_equality_delete_record_count_threshold: Option<u64>,
     ) -> SnapshotStats {
         use crate::file_selection::strategy::{
-            EqualityDeleteRecordCountFilterStrategy, PositionDeleteRowCountFilterStrategy,
+            EqualityDeleteRecordCountFilterStrategy, PositionDeleteRecordCountFilterStrategy,
         };
 
         let mut stats = SnapshotStats::default();
@@ -330,9 +330,9 @@ impl AutoCompactionPlanner {
 
             let is_delete_heavy = (min_delete_file_count_threshold > 0
                 && task.deletes.len() >= min_delete_file_count_threshold)
-                || min_position_delete_row_count_threshold.is_some_and(|threshold| {
+                || min_position_delete_record_count_threshold.is_some_and(|threshold| {
                     threshold > 0
-                        && PositionDeleteRowCountFilterStrategy::approx_deleted_row_count(task)
+                        && PositionDeleteRecordCountFilterStrategy::approx_deleted_row_count(task)
                             >= threshold
                 })
                 || min_equality_delete_record_count_threshold.is_some_and(|threshold| {

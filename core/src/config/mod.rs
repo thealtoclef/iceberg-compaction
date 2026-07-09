@@ -290,7 +290,7 @@ pub struct FilesWithDeletesConfig {
     /// is selected if any of the three thresholds is met. `None` or
     /// `Some(0)` disables this check.
     #[builder(default, setter(strip_option))]
-    pub min_position_delete_row_count_threshold: Option<u64>,
+    pub min_position_delete_record_count_threshold: Option<u64>,
 
     /// Minimum accumulated equality-delete record count required to trigger
     /// compaction.
@@ -303,7 +303,7 @@ pub struct FilesWithDeletesConfig {
     /// equality-delete file's records may apply to several data files.
     ///
     /// Combined with `min_delete_file_count_threshold` and
-    /// `min_position_delete_row_count_threshold` via logical OR — a file is selected
+    /// `min_position_delete_record_count_threshold` via logical OR — a file is selected
     /// if any threshold is met. `None` or `Some(0)` disables this check.
     #[builder(default, setter(strip_option))]
     pub min_equality_delete_record_count_threshold: Option<u64>,
@@ -366,12 +366,12 @@ pub struct SmallFilesWithDeleteConfig {
     /// Minimum approximate deleted row count required to select a file via
     /// the files-with-deletes predicate.
     ///
-    /// See `FilesWithDeletesConfig::min_position_delete_row_count_threshold` for how
+    /// See `FilesWithDeletesConfig::min_position_delete_record_count_threshold` for how
     /// this is approximated. Combined with the size, delete-file-count, and
     /// equality-delete-record-count predicates via logical OR. `None` or
     /// `Some(0)` disables this check.
     #[builder(default, setter(strip_option))]
-    pub min_position_delete_row_count_threshold: Option<u64>,
+    pub min_position_delete_record_count_threshold: Option<u64>,
 
     /// See `FilesWithDeletesConfig::min_equality_delete_record_count_threshold`.
     /// Combined with the size, delete-file-count, and delete-row-count
@@ -705,10 +705,10 @@ pub struct AutoCompactionConfig {
     #[builder(default = "DEFAULT_MIN_DELETE_FILE_COUNT_THRESHOLD")]
     pub min_delete_file_count_threshold: usize,
 
-    /// See `FilesWithDeletesConfig::min_position_delete_row_count_threshold`. `None`
+    /// See `FilesWithDeletesConfig::min_position_delete_record_count_threshold`. `None`
     /// (default) disables this check for auto-selected candidates.
     #[builder(default, setter(strip_option))]
-    pub min_position_delete_row_count_threshold: Option<u64>,
+    pub min_position_delete_record_count_threshold: Option<u64>,
 
     /// See `FilesWithDeletesConfig::min_equality_delete_record_count_threshold`.
     /// `None` (default) disables this check for auto-selected candidates.
@@ -735,7 +735,7 @@ impl AutoCompactionConfig {
 
         let any_delete_threshold_enabled = self.min_delete_file_count_threshold > 0
             || self
-                .min_position_delete_row_count_threshold
+                .min_position_delete_record_count_threshold
                 .is_some_and(|threshold| threshold > 0)
             || self
                 .min_equality_delete_record_count_threshold
@@ -757,8 +757,8 @@ impl AutoCompactionConfig {
                     grouping_strategy: self.grouping_strategy.clone(),
                     file_group_scope: FileGroupScope::Partition,
                     min_delete_file_count_threshold: self.min_delete_file_count_threshold,
-                    min_position_delete_row_count_threshold: self
-                        .min_position_delete_row_count_threshold,
+                    min_position_delete_record_count_threshold: self
+                        .min_position_delete_record_count_threshold,
                     min_equality_delete_record_count_threshold: self
                         .min_equality_delete_record_count_threshold,
                     group_filters: self.group_filters.clone(),

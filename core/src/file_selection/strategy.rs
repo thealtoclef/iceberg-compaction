@@ -598,15 +598,15 @@ impl std::fmt::Display for DeleteFileCountFilterStrategy {
 /// double/over-counted across the files they cover — so this is a
 /// conservative approximation, not an exact count, matching Java's tradeoff.
 #[derive(Debug)]
-pub struct PositionDeleteRowCountFilterStrategy {
+pub struct PositionDeleteRecordCountFilterStrategy {
     /// Minimum approximate deleted row count threshold (inclusive).
-    pub min_position_delete_row_count: u64,
+    pub min_position_delete_record_count: u64,
 }
 
-impl PositionDeleteRowCountFilterStrategy {
-    pub fn new(min_position_delete_row_count: u64) -> Self {
+impl PositionDeleteRecordCountFilterStrategy {
+    pub fn new(min_position_delete_record_count: u64) -> Self {
         Self {
-            min_position_delete_row_count,
+            min_position_delete_record_count,
         }
     }
 
@@ -629,23 +629,23 @@ impl PositionDeleteRowCountFilterStrategy {
     }
 }
 
-impl FileFilterStrategy for PositionDeleteRowCountFilterStrategy {
+impl FileFilterStrategy for PositionDeleteRecordCountFilterStrategy {
     fn filter(&self, data_files: Vec<FileScanTask>) -> Vec<FileScanTask> {
         data_files
             .into_iter()
             .filter(|task| {
-                Self::approx_deleted_row_count(task) >= self.min_position_delete_row_count
+                Self::approx_deleted_row_count(task) >= self.min_position_delete_record_count
             })
             .collect()
     }
 }
 
-impl std::fmt::Display for PositionDeleteRowCountFilterStrategy {
+impl std::fmt::Display for PositionDeleteRecordCountFilterStrategy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "PositionDeleteRowCountFilter[>={} rows]",
-            self.min_position_delete_row_count
+            "PositionDeleteRecordCountFilter[>={} records]",
+            self.min_position_delete_record_count
         )
     }
 }
@@ -654,7 +654,7 @@ impl std::fmt::Display for PositionDeleteRowCountFilterStrategy {
 ///
 /// Some catalogs/engines (e.g. `BigLake`) cap how many equality-delete records
 /// may apply to a single data file at read time (`BigLake`'s limit is
-/// 100,000). Unlike [`PositionDeleteRowCountFilterStrategy`], this does not
+/// 100,000). Unlike [`PositionDeleteRecordCountFilterStrategy`], this does not
 /// approximate deleted *rows* — it sums the raw `record_count` of the
 /// equality-delete files attached to a task, which is the quantity such
 /// engines actually cap. It is not clamped to the data file's own record
@@ -686,7 +686,7 @@ impl EqualityDeleteRecordCountFilterStrategy {
 
 /// Sums `record_count` over the entries in `task.deletes` matching `predicate`.
 ///
-/// Shared by [`PositionDeleteRowCountFilterStrategy`] and
+/// Shared by [`PositionDeleteRecordCountFilterStrategy`] and
 /// [`EqualityDeleteRecordCountFilterStrategy`], which differ only in which
 /// deletes they classify as countable and whether the sum is clamped
 /// afterwards.
@@ -1023,7 +1023,7 @@ impl PlanStrategy {
     /// delete ratio — checks are combined with OR, not AND.
     fn delete_predicate_filters(
         min_delete_file_count_threshold: usize,
-        min_position_delete_row_count_threshold: Option<u64>,
+        min_position_delete_record_count_threshold: Option<u64>,
         min_equality_delete_record_count_threshold: Option<u64>,
     ) -> Vec<Box<dyn FileFilterStrategy>> {
         let mut delete_filters: Vec<Box<dyn FileFilterStrategy>> = vec![];
@@ -1034,11 +1034,11 @@ impl PlanStrategy {
             )));
         }
 
-        if let Some(min_position_delete_row_count) =
-            min_position_delete_row_count_threshold.filter(|&count| count > 0)
+        if let Some(min_position_delete_record_count) =
+            min_position_delete_record_count_threshold.filter(|&count| count > 0)
         {
-            delete_filters.push(Box::new(PositionDeleteRowCountFilterStrategy::new(
-                min_position_delete_row_count,
+            delete_filters.push(Box::new(PositionDeleteRecordCountFilterStrategy::new(
+                min_position_delete_record_count,
             )));
         }
 
@@ -1061,7 +1061,7 @@ impl PlanStrategy {
     pub fn from_files_with_deletes(config: &crate::config::FilesWithDeletesConfig) -> Self {
         let mut delete_filters = Self::delete_predicate_filters(
             config.min_delete_file_count_threshold,
-            config.min_position_delete_row_count_threshold,
+            config.min_position_delete_record_count_threshold,
             config.min_equality_delete_record_count_threshold,
         );
 
@@ -1102,7 +1102,7 @@ impl PlanStrategy {
 
         or_filters.extend(Self::delete_predicate_filters(
             config.min_delete_file_count_threshold,
-            config.min_position_delete_row_count_threshold,
+            config.min_position_delete_record_count_threshold,
             config.min_equality_delete_record_count_threshold,
         ));
 
@@ -2759,11 +2759,11 @@ mod tests {
     }
 
     #[test]
-    fn test_position_delete_row_count_filter_strategy() {
-        let strategy = PositionDeleteRowCountFilterStrategy::new(50);
+    fn test_position_delete_record_count_filter_strategy() {
+        let strategy = PositionDeleteRecordCountFilterStrategy::new(50);
         assert_eq!(
             strategy.to_string(),
-            "PositionDeleteRowCountFilter[>=50 rows]"
+            "PositionDeleteRecordCountFilter[>=50 records]"
         );
 
         // File-scoped position delete (referenced_data_file set) counts towards the total.
@@ -2824,7 +2824,7 @@ mod tests {
             Some("clamped.parquet".to_owned()),
         ));
         // Without clamping this would pass a >=500 threshold; clamped to 40 it should not.
-        let high_threshold_strategy = PositionDeleteRowCountFilterStrategy::new(500);
+        let high_threshold_strategy = PositionDeleteRecordCountFilterStrategy::new(500);
         assert_eq!(
             high_threshold_strategy.filter(vec![clamped]).len(),
             0,
@@ -2954,7 +2954,7 @@ mod tests {
         // All three thresholds configured: a file matching ANY is selected (logical OR).
         let all_config = FilesWithDeletesConfigBuilder::default()
             .min_delete_file_count_threshold(3_usize)
-            .min_position_delete_row_count_threshold(1000_u64)
+            .min_position_delete_record_count_threshold(1000_u64)
             .min_equality_delete_record_count_threshold(100_000_u64)
             .build()
             .unwrap();
@@ -2986,20 +2986,21 @@ mod tests {
     }
 
     #[test]
-    fn test_files_with_deletes_strategy_position_delete_row_count_threshold_ored_with_file_count() {
+    fn test_files_with_deletes_strategy_position_delete_record_count_threshold_ored_with_file_count()
+     {
         use crate::config::FilesWithDeletesConfigBuilder;
 
         // Only the row-count predicate is configured (file-count check disabled).
         let config = FilesWithDeletesConfigBuilder::default()
             .min_delete_file_count_threshold(0_usize)
-            .min_position_delete_row_count_threshold(50_u64)
+            .min_position_delete_record_count_threshold(50_u64)
             .build()
             .unwrap();
         let strategy = PlanStrategy::from(&CompactionPlanningConfig::FilesWithDeletes(config));
         assert!(
             strategy
                 .to_string()
-                .contains("PositionDeleteRowCountFilter")
+                .contains("PositionDeleteRecordCountFilter")
         );
         assert!(!strategy.to_string().contains("DeleteFileCountFilter"));
 
@@ -3026,7 +3027,7 @@ mod tests {
         // mirroring Apache Iceberg's tooManyDeletes() || tooHighDeleteRatio().
         let both_config = FilesWithDeletesConfigBuilder::default()
             .min_delete_file_count_threshold(3_usize)
-            .min_position_delete_row_count_threshold(1000_u64)
+            .min_position_delete_record_count_threshold(1000_u64)
             .build()
             .unwrap();
         let both_strategy =
@@ -3187,21 +3188,21 @@ mod tests {
     }
 
     #[test]
-    fn test_small_files_with_delete_strategy_position_delete_row_count_predicate() {
+    fn test_small_files_with_delete_strategy_position_delete_record_count_predicate() {
         use crate::config::SmallFilesWithDeleteConfigBuilder;
 
         // Only size and row-count predicates enabled (file-count check disabled).
         let config = SmallFilesWithDeleteConfigBuilder::default()
             .small_file_threshold_bytes(20 * 1024 * 1024_u64)
             .min_delete_file_count_threshold(0_usize)
-            .min_position_delete_row_count_threshold(50_u64)
+            .min_position_delete_record_count_threshold(50_u64)
             .build()
             .unwrap();
         let strategy = PlanStrategy::from(&CompactionPlanningConfig::SmallFilesWithDelete(config));
 
         let desc = strategy.to_string();
         assert!(desc.contains("SizeFilter"));
-        assert!(desc.contains("PositionDeleteRowCountFilter"));
+        assert!(desc.contains("PositionDeleteRecordCountFilter"));
         assert!(!desc.contains("DeleteFileCountFilter"));
 
         let mut large_with_many_deleted_rows =
