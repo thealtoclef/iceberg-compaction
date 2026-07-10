@@ -24,7 +24,7 @@
 //!
 //! Parallelism is calculated per group based on file size and count constraints.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use iceberg::scan::FileScanTask;
 
@@ -825,6 +825,7 @@ pub struct PlanStrategyOptions {
     grouping: GroupingStrategyEnum,
     file_group_scope: FileGroupScope,
     group_filters: Vec<Box<dyn GroupFilterStrategy>>,
+    delete_exempt_filters: Vec<Box<dyn FileFilterStrategy>>,
 }
 
 impl PlanStrategyOptions {
@@ -844,6 +845,7 @@ impl PlanStrategyOptions {
             grouping,
             file_group_scope: FileGroupScope::Partition,
             group_filters,
+            delete_exempt_filters: vec![],
         }
     }
 
@@ -851,6 +853,23 @@ impl PlanStrategyOptions {
     #[must_use]
     pub fn with_file_group_scope(mut self, file_group_scope: FileGroupScope) -> Self {
         self.file_group_scope = file_group_scope;
+        self
+    }
+
+    /// Sets file filters used only to compute the group-filter exemption set.
+    ///
+    /// A group is exempt from every filter in `group_filters` if at least one
+    /// of its data files matches one of these filters. This mirrors Apache
+    /// Iceberg's `BinPackRewriteFilePlanner.filterFileGroups`, which OR's
+    /// `enoughInputFiles(group)` with `group.stream().anyMatch(this::tooManyDeletes)`
+    /// (and the delete-ratio equivalent) rather than gating delete-driven
+    /// selection behind an unrelated data-file-count/size check.
+    #[must_use]
+    pub fn with_delete_exempt_filters(
+        mut self,
+        delete_exempt_filters: Vec<Box<dyn FileFilterStrategy>>,
+    ) -> Self {
+        self.delete_exempt_filters = delete_exempt_filters;
         self
     }
 }
@@ -864,6 +883,7 @@ pub struct PlanStrategy {
     grouping: GroupingStrategyEnum,
     file_group_scope: FileGroupScope,
     group_filters: Vec<Box<dyn GroupFilterStrategy>>,
+    delete_exempt_filters: Vec<Box<dyn FileFilterStrategy>>,
 }
 
 impl PlanStrategy {
@@ -893,13 +913,15 @@ impl PlanStrategy {
             grouping: options.grouping,
             file_group_scope: options.file_group_scope,
             group_filters: options.group_filters,
+            delete_exempt_filters: options.delete_exempt_filters,
         }
     }
 
     /// Executes the pipeline:
     /// 1. Apply each file filter sequentially
     /// 2. Group files using the configured file-group scope and grouping strategy
-    /// 3. Apply each group filter sequentially
+    /// 3. Apply each group filter sequentially, except to groups exempted by
+    ///    [`delete_exempt_filters`](PlanStrategyOptions::with_delete_exempt_filters)
     /// 4. Calculate parallelism for each group via [`FileGroup::with_calculated_parallelism`]
     ///
     /// # Errors
@@ -916,9 +938,42 @@ impl PlanStrategy {
 
         let file_groups = self.group_files(filtered_files);
 
+        // Files that qualified purely because of a delete predicate (delete
+        // file count, position-delete row count, or equality-delete record
+        // count). Any group containing at least one such file is exempt from
+        // `group_filters` below, mirroring Apache Iceberg's
+        // `BinPackRewriteFilePlanner.filterFileGroups`, which OR's the
+        // input-file-count/size checks with a per-file delete-predicate
+        // `anyMatch` over the group instead of gating one behind the other.
+        let exempt_paths: HashSet<String> = self
+            .delete_exempt_filters
+            .iter()
+            .flat_map(|filter| {
+                filter.filter(
+                    file_groups
+                        .iter()
+                        .flat_map(|g| g.data_files.clone())
+                        .collect(),
+                )
+            })
+            .map(|f| f.data_file_path)
+            .collect();
+
         let mut file_groups = file_groups;
         for filter in &self.group_filters {
-            file_groups = filter.filter_groups(file_groups);
+            if exempt_paths.is_empty() {
+                file_groups = filter.filter_groups(file_groups);
+                continue;
+            }
+
+            let (exempt, candidates): (Vec<_>, Vec<_>) = file_groups.into_iter().partition(|g| {
+                g.data_files
+                    .iter()
+                    .any(|f| exempt_paths.contains(&f.data_file_path))
+            });
+            let mut kept = filter.filter_groups(candidates);
+            kept.extend(exempt);
+            file_groups = kept;
         }
 
         file_groups
@@ -1109,6 +1164,19 @@ impl PlanStrategy {
         let file_filters: Vec<Box<dyn FileFilterStrategy>> =
             vec![Box::new(OrFilterStrategy::new(or_filters))];
 
+        // Rebuilt (not shared with `or_filters` above, since `Box<dyn
+        // FileFilterStrategy>` isn't `Clone`) so a group can be exempted from
+        // `group_filters` purely for having a delete-heavy file, independent
+        // of whether it also happens to be small. Mirrors Apache Iceberg's
+        // `BinPackRewriteFilePlanner`, where `tooManyDeletes`/`tooHighDeleteRatio`
+        // are reused as both a file-selection predicate and a group-filter
+        // escape hatch.
+        let delete_exempt_filters = Self::delete_predicate_filters(
+            config.min_delete_file_count_threshold,
+            config.min_position_delete_record_count_threshold,
+            config.min_equality_delete_record_count_threshold,
+        );
+
         let (grouping, group_filters) = Self::build_grouping_and_filters(
             &config.grouping_strategy,
             config.group_filters.as_ref(),
@@ -1116,7 +1184,8 @@ impl PlanStrategy {
 
         Self::new_with_options(
             PlanStrategyOptions::new(file_filters, grouping, group_filters)
-                .with_file_group_scope(config.file_group_scope),
+                .with_file_group_scope(config.file_group_scope)
+                .with_delete_exempt_filters(delete_exempt_filters),
         )
     }
 
@@ -3228,6 +3297,69 @@ mod tests {
         result.sort_by(|a, b| a.data_file_path.cmp(&b.data_file_path));
 
         TestUtils::assert_paths_eq(&["large_with_many_deleted_rows.parquet"], &result);
+    }
+
+    #[test]
+    fn test_small_files_with_delete_group_file_count_exemption() {
+        use crate::config::{GroupFilters, GroupingStrategy, SmallFilesWithDeleteConfigBuilder};
+
+        // min_group_file_count=2, but the delete-triggered group below only
+        // ever has 1 data file. Without the exemption, this group would be
+        // silently dropped and its 20 equality-delete files would never get
+        // cleaned up.
+        let config = SmallFilesWithDeleteConfigBuilder::default()
+            .small_file_threshold_bytes(1_u64) // disable the size predicate
+            .min_delete_file_count_threshold(2_usize)
+            .grouping_strategy(GroupingStrategy::Single)
+            .group_filters(GroupFilters {
+                min_group_size_bytes: None,
+                min_group_file_count: Some(2),
+            })
+            .build()
+            .unwrap();
+        let strategy = PlanStrategy::from(&CompactionPlanningConfig::SmallFilesWithDelete(config));
+
+        let delete_heavy_lone_file = TestUtils::add_delete_files(
+            TestFileBuilder::new("delete_heavy_lone_file.parquet")
+                .size(50 * 1024 * 1024)
+                .build(),
+            20,
+        );
+
+        let result = TestUtils::execute_strategy_flat(&strategy, vec![delete_heavy_lone_file]);
+
+        TestUtils::assert_paths_eq(&["delete_heavy_lone_file.parquet"], &result);
+    }
+
+    #[test]
+    fn test_small_files_with_delete_group_file_count_still_applies_without_deletes() {
+        use crate::config::{GroupFilters, GroupingStrategy, SmallFilesWithDeleteConfigBuilder};
+
+        // Control case: a lone small file with no deletes at all must still be
+        // rejected by min_group_file_count. The exemption must not leak into
+        // groups that never matched a delete predicate.
+        let config = SmallFilesWithDeleteConfigBuilder::default()
+            .small_file_threshold_bytes(20 * 1024 * 1024_u64)
+            .min_delete_file_count_threshold(2_usize)
+            .grouping_strategy(GroupingStrategy::Single)
+            .group_filters(GroupFilters {
+                min_group_size_bytes: None,
+                min_group_file_count: Some(2),
+            })
+            .build()
+            .unwrap();
+        let strategy = PlanStrategy::from(&CompactionPlanningConfig::SmallFilesWithDelete(config));
+
+        let lone_small_file = TestFileBuilder::new("lone_small_file.parquet")
+            .size(5 * 1024 * 1024)
+            .build();
+
+        let result = TestUtils::execute_strategy_flat(&strategy, vec![lone_small_file]);
+
+        assert!(
+            result.is_empty(),
+            "lone small file without deletes should still be rejected by min_group_file_count"
+        );
     }
 
     #[test]
