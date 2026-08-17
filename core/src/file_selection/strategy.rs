@@ -24,7 +24,7 @@
 //!
 //! Parallelism is calculated per group based on file size and count constraints.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use iceberg::scan::FileScanTask;
 
@@ -582,6 +582,189 @@ impl std::fmt::Display for DeleteFileCountFilterStrategy {
     }
 }
 
+/// File filter by approximate deleted row count.
+///
+/// Approximates the number of rows deleted from a data file using only
+/// manifest metadata already available at planning time (no file content is
+/// read). Mirrors Apache Iceberg's `BinPackRewriteFilePlanner.tooHighDeleteRatio()`:
+/// sums `record_count` over "file-scoped" deletes only — deletion vectors and
+/// position-delete files with `referenced_data_file` set — and clamps the sum
+/// to the data file's own `record_count`.
+///
+/// Equality deletes are always excluded: the number of rows they actually
+/// remove cannot be determined without reading both the delete file's key
+/// values and the data file's column values. Partition-scoped position
+/// deletes (no `referenced_data_file`) are also excluded rather than
+/// double/over-counted across the files they cover — so this is a
+/// conservative approximation, not an exact count, matching Java's tradeoff.
+#[derive(Debug)]
+pub struct PositionDeleteRecordCountFilterStrategy {
+    /// Minimum approximate deleted row count threshold (inclusive).
+    pub min_position_delete_record_count: u64,
+}
+
+impl PositionDeleteRecordCountFilterStrategy {
+    pub fn new(min_position_delete_record_count: u64) -> Self {
+        Self {
+            min_position_delete_record_count,
+        }
+    }
+
+    /// Returns whether `delete` can be attributed to a single, specific data
+    /// file from metadata alone (deletion vectors and explicit per-file
+    /// position deletes). Equality deletes and partition-scoped position
+    /// deletes return `false`.
+    fn is_file_scoped(delete: &FileScanTask) -> bool {
+        delete.data_file_content == iceberg::spec::DataContentType::PositionDeletes
+            && delete.referenced_data_file.is_some()
+    }
+
+    pub(crate) fn approx_deleted_row_count(task: &FileScanTask) -> u64 {
+        let known_deleted_record_count = sum_delete_record_count(task, Self::is_file_scoped);
+
+        match task.record_count {
+            Some(record_count) => known_deleted_record_count.min(record_count),
+            None => known_deleted_record_count,
+        }
+    }
+}
+
+impl FileFilterStrategy for PositionDeleteRecordCountFilterStrategy {
+    fn filter(&self, data_files: Vec<FileScanTask>) -> Vec<FileScanTask> {
+        data_files
+            .into_iter()
+            .filter(|task| {
+                Self::approx_deleted_row_count(task) >= self.min_position_delete_record_count
+            })
+            .collect()
+    }
+}
+
+impl std::fmt::Display for PositionDeleteRecordCountFilterStrategy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "PositionDeleteRecordCountFilter[>={} records]",
+            self.min_position_delete_record_count
+        )
+    }
+}
+
+/// File filter by accumulated equality-delete record count.
+///
+/// Some catalogs/engines (e.g. `BigLake`) cap how many equality-delete records
+/// may apply to a single data file at read time (`BigLake`'s limit is
+/// 100,000). Unlike [`PositionDeleteRecordCountFilterStrategy`], this does not
+/// approximate deleted *rows* — it sums the raw `record_count` of the
+/// equality-delete files attached to a task, which is the quantity such
+/// engines actually cap. It is not clamped to the data file's own record
+/// count: the limit being guarded against is a delete-entry count, not a
+/// row count, and a single equality-delete file's records may apply to
+/// several data files, so an individual file's exposure can legitimately
+/// exceed its own row count.
+#[derive(Debug)]
+pub struct EqualityDeleteRecordCountFilterStrategy {
+    /// Minimum accumulated equality-delete record count threshold (inclusive).
+    pub min_equality_delete_record_count: u64,
+}
+
+impl EqualityDeleteRecordCountFilterStrategy {
+    pub fn new(min_equality_delete_record_count: u64) -> Self {
+        Self {
+            min_equality_delete_record_count,
+        }
+    }
+
+    fn is_equality_delete(delete: &FileScanTask) -> bool {
+        delete.data_file_content == iceberg::spec::DataContentType::EqualityDeletes
+    }
+
+    pub(crate) fn equality_delete_record_count(task: &FileScanTask) -> u64 {
+        sum_delete_record_count(task, Self::is_equality_delete)
+    }
+}
+
+/// Sums `record_count` over the entries in `task.deletes` matching `predicate`.
+///
+/// Shared by [`PositionDeleteRecordCountFilterStrategy`] and
+/// [`EqualityDeleteRecordCountFilterStrategy`], which differ only in which
+/// deletes they classify as countable and whether the sum is clamped
+/// afterwards.
+fn sum_delete_record_count(task: &FileScanTask, predicate: impl Fn(&FileScanTask) -> bool) -> u64 {
+    task.deletes
+        .iter()
+        .filter(|delete| predicate(delete))
+        .map(|delete| delete.record_count.unwrap_or(0))
+        .sum()
+}
+
+impl FileFilterStrategy for EqualityDeleteRecordCountFilterStrategy {
+    fn filter(&self, data_files: Vec<FileScanTask>) -> Vec<FileScanTask> {
+        data_files
+            .into_iter()
+            .filter(|task| {
+                Self::equality_delete_record_count(task) >= self.min_equality_delete_record_count
+            })
+            .collect()
+    }
+}
+
+impl std::fmt::Display for EqualityDeleteRecordCountFilterStrategy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "EqualityDeleteRecordCountFilter[>={} records]",
+            self.min_equality_delete_record_count
+        )
+    }
+}
+
+/// File filter that selects a file if *any* wrapped filter selects it (logical OR).
+///
+/// Unlike [`PlanStrategy::execute`]'s sequential AND-chaining of top-level file
+/// filters, this combinator unions the results of its inner filters, deduplicated
+/// by `data_file_path`, preserving the order in which files first matched.
+#[derive(Debug)]
+pub struct OrFilterStrategy {
+    pub filters: Vec<Box<dyn FileFilterStrategy>>,
+}
+
+impl OrFilterStrategy {
+    pub fn new(filters: Vec<Box<dyn FileFilterStrategy>>) -> Self {
+        Self { filters }
+    }
+}
+
+impl FileFilterStrategy for OrFilterStrategy {
+    fn filter(&self, data_files: Vec<FileScanTask>) -> Vec<FileScanTask> {
+        let mut seen = std::collections::HashSet::new();
+        let mut result = Vec::new();
+
+        for filter in &self.filters {
+            for task in filter.filter(data_files.clone()) {
+                if seen.insert(task.data_file_path.clone()) {
+                    result.push(task);
+                }
+            }
+        }
+
+        result
+    }
+}
+
+impl std::fmt::Display for OrFilterStrategy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Or[")?;
+        for (i, filter) in self.filters.iter().enumerate() {
+            if i > 0 {
+                write!(f, " | ")?;
+            }
+            write!(f, "{}", filter)?;
+        }
+        write!(f, "]")
+    }
+}
+
 /// Group filter by minimum total size.
 ///
 /// Filters by `group.total_size >= min_group_size`.
@@ -642,6 +825,7 @@ pub struct PlanStrategyOptions {
     grouping: GroupingStrategyEnum,
     file_group_scope: FileGroupScope,
     group_filters: Vec<Box<dyn GroupFilterStrategy>>,
+    delete_exempt_filters: Vec<Box<dyn FileFilterStrategy>>,
 }
 
 impl PlanStrategyOptions {
@@ -661,6 +845,7 @@ impl PlanStrategyOptions {
             grouping,
             file_group_scope: FileGroupScope::Partition,
             group_filters,
+            delete_exempt_filters: vec![],
         }
     }
 
@@ -668,6 +853,23 @@ impl PlanStrategyOptions {
     #[must_use]
     pub fn with_file_group_scope(mut self, file_group_scope: FileGroupScope) -> Self {
         self.file_group_scope = file_group_scope;
+        self
+    }
+
+    /// Sets file filters used only to compute the group-filter exemption set.
+    ///
+    /// A group is exempt from every filter in `group_filters` if at least one
+    /// of its data files matches one of these filters. This mirrors Apache
+    /// Iceberg's `BinPackRewriteFilePlanner.filterFileGroups`, which OR's
+    /// `enoughInputFiles(group)` with `group.stream().anyMatch(this::tooManyDeletes)`
+    /// (and the delete-ratio equivalent) rather than gating delete-driven
+    /// selection behind an unrelated data-file-count/size check.
+    #[must_use]
+    pub fn with_delete_exempt_filters(
+        mut self,
+        delete_exempt_filters: Vec<Box<dyn FileFilterStrategy>>,
+    ) -> Self {
+        self.delete_exempt_filters = delete_exempt_filters;
         self
     }
 }
@@ -681,6 +883,7 @@ pub struct PlanStrategy {
     grouping: GroupingStrategyEnum,
     file_group_scope: FileGroupScope,
     group_filters: Vec<Box<dyn GroupFilterStrategy>>,
+    delete_exempt_filters: Vec<Box<dyn FileFilterStrategy>>,
 }
 
 impl PlanStrategy {
@@ -710,13 +913,15 @@ impl PlanStrategy {
             grouping: options.grouping,
             file_group_scope: options.file_group_scope,
             group_filters: options.group_filters,
+            delete_exempt_filters: options.delete_exempt_filters,
         }
     }
 
     /// Executes the pipeline:
     /// 1. Apply each file filter sequentially
     /// 2. Group files using the configured file-group scope and grouping strategy
-    /// 3. Apply each group filter sequentially
+    /// 3. Apply each group filter sequentially, except to groups exempted by
+    ///    [`delete_exempt_filters`](PlanStrategyOptions::with_delete_exempt_filters)
     /// 4. Calculate parallelism for each group via [`FileGroup::with_calculated_parallelism`]
     ///
     /// # Errors
@@ -733,9 +938,42 @@ impl PlanStrategy {
 
         let file_groups = self.group_files(filtered_files);
 
+        // Files that qualified purely because of a delete predicate (delete
+        // file count, position-delete row count, or equality-delete record
+        // count). Any group containing at least one such file is exempt from
+        // `group_filters` below, mirroring Apache Iceberg's
+        // `BinPackRewriteFilePlanner.filterFileGroups`, which OR's the
+        // input-file-count/size checks with a per-file delete-predicate
+        // `anyMatch` over the group instead of gating one behind the other.
+        let exempt_paths: HashSet<String> = self
+            .delete_exempt_filters
+            .iter()
+            .flat_map(|filter| {
+                filter.filter(
+                    file_groups
+                        .iter()
+                        .flat_map(|g| g.data_files.clone())
+                        .collect(),
+                )
+            })
+            .map(|f| f.data_file_path)
+            .collect();
+
         let mut file_groups = file_groups;
         for filter in &self.group_filters {
-            file_groups = filter.filter_groups(file_groups);
+            if exempt_paths.is_empty() {
+                file_groups = filter.filter_groups(file_groups);
+                continue;
+            }
+
+            let (exempt, candidates): (Vec<_>, Vec<_>) = file_groups.into_iter().partition(|g| {
+                g.data_files
+                    .iter()
+                    .any(|f| exempt_paths.contains(&f.data_file_path))
+            });
+            let mut kept = filter.filter_groups(candidates);
+            kept.extend(exempt);
+            file_groups = kept;
         }
 
         file_groups
@@ -830,17 +1068,63 @@ impl PlanStrategy {
         )
     }
 
-    /// Constructs strategy for files with delete files.
+    /// Builds the individual delete-based predicates (file count,
+    /// approximate row count, and/or equality-delete record count) that are
+    /// enabled by their respective thresholds. A threshold of `0` (or
+    /// `None`) disables the corresponding predicate.
     ///
-    /// Adds `DeleteFileCountFilterStrategy` if `min_delete_file_count_threshold > 0`.
-    pub fn from_files_with_deletes(config: &crate::config::FilesWithDeletesConfig) -> Self {
-        let mut file_filters: Vec<Box<dyn FileFilterStrategy>> = vec![];
+    /// Mirrors Apache Iceberg's `BinPackRewriteFilePlanner`, which selects a
+    /// task if it has too many delete files OR too high an (approximate)
+    /// delete ratio — checks are combined with OR, not AND.
+    fn delete_predicate_filters(
+        min_delete_file_count_threshold: usize,
+        min_position_delete_record_count_threshold: Option<u64>,
+        min_equality_delete_record_count_threshold: Option<u64>,
+    ) -> Vec<Box<dyn FileFilterStrategy>> {
+        let mut delete_filters: Vec<Box<dyn FileFilterStrategy>> = vec![];
 
-        if config.min_delete_file_count_threshold > 0 {
-            file_filters.push(Box::new(DeleteFileCountFilterStrategy::new(
-                config.min_delete_file_count_threshold,
+        if min_delete_file_count_threshold > 0 {
+            delete_filters.push(Box::new(DeleteFileCountFilterStrategy::new(
+                min_delete_file_count_threshold,
             )));
         }
+
+        if let Some(min_position_delete_record_count) =
+            min_position_delete_record_count_threshold.filter(|&count| count > 0)
+        {
+            delete_filters.push(Box::new(PositionDeleteRecordCountFilterStrategy::new(
+                min_position_delete_record_count,
+            )));
+        }
+
+        if let Some(min_equality_delete_record_count) =
+            min_equality_delete_record_count_threshold.filter(|&count| count > 0)
+        {
+            delete_filters.push(Box::new(EqualityDeleteRecordCountFilterStrategy::new(
+                min_equality_delete_record_count,
+            )));
+        }
+
+        delete_filters
+    }
+
+    /// Constructs strategy for files with delete files.
+    ///
+    /// Adds a delete-based filter (file count, approximate row count, and/or
+    /// equality-delete record count, OR'd together) via
+    /// [`delete_predicate_filters`](Self::delete_predicate_filters).
+    pub fn from_files_with_deletes(config: &crate::config::FilesWithDeletesConfig) -> Self {
+        let mut delete_filters = Self::delete_predicate_filters(
+            config.min_delete_file_count_threshold,
+            config.min_position_delete_record_count_threshold,
+            config.min_equality_delete_record_count_threshold,
+        );
+
+        let file_filters: Vec<Box<dyn FileFilterStrategy>> = match delete_filters.len() {
+            0 => vec![],
+            1 => vec![delete_filters.pop().unwrap()],
+            _ => vec![Box::new(OrFilterStrategy::new(delete_filters))],
+        };
 
         let (grouping, group_filters) = Self::build_grouping_and_filters(
             &config.grouping_strategy,
@@ -850,6 +1134,58 @@ impl PlanStrategy {
         Self::new_with_options(
             PlanStrategyOptions::new(file_filters, grouping, group_filters)
                 .with_file_group_scope(config.file_group_scope),
+        )
+    }
+
+    /// Constructs strategy for the combined small-files-with-delete compaction.
+    ///
+    /// Selects a file if it matches *any* of: the small-files predicate (size
+    /// below `small_file_threshold_bytes`), the files-with-deletes file-count
+    /// predicate, the approximate delete-row-count predicate, or the
+    /// equality-delete record-count predicate — all OR'd together via
+    /// [`OrFilterStrategy`]. A threshold of `0` (or `None`) for a delete
+    /// predicate disables that half of the OR (an unset size bound always
+    /// passes, so the size predicate is always included, matching
+    /// [`from_small_files`](Self::from_small_files)).
+    pub fn from_small_files_with_delete(
+        config: &crate::config::SmallFilesWithDeleteConfig,
+    ) -> Self {
+        let mut or_filters: Vec<Box<dyn FileFilterStrategy>> = vec![Box::new(SizeFilterStrategy {
+            min_size: None,
+            max_size: Some(config.small_file_threshold_bytes),
+        })];
+
+        or_filters.extend(Self::delete_predicate_filters(
+            config.min_delete_file_count_threshold,
+            config.min_position_delete_record_count_threshold,
+            config.min_equality_delete_record_count_threshold,
+        ));
+
+        let file_filters: Vec<Box<dyn FileFilterStrategy>> =
+            vec![Box::new(OrFilterStrategy::new(or_filters))];
+
+        // Rebuilt (not shared with `or_filters` above, since `Box<dyn
+        // FileFilterStrategy>` isn't `Clone`) so a group can be exempted from
+        // `group_filters` purely for having a delete-heavy file, independent
+        // of whether it also happens to be small. Mirrors Apache Iceberg's
+        // `BinPackRewriteFilePlanner`, where `tooManyDeletes`/`tooHighDeleteRatio`
+        // are reused as both a file-selection predicate and a group-filter
+        // escape hatch.
+        let delete_exempt_filters = Self::delete_predicate_filters(
+            config.min_delete_file_count_threshold,
+            config.min_position_delete_record_count_threshold,
+            config.min_equality_delete_record_count_threshold,
+        );
+
+        let (grouping, group_filters) = Self::build_grouping_and_filters(
+            &config.grouping_strategy,
+            config.group_filters.as_ref(),
+        );
+
+        Self::new_with_options(
+            PlanStrategyOptions::new(file_filters, grouping, group_filters)
+                .with_file_group_scope(config.file_group_scope)
+                .with_delete_exempt_filters(delete_exempt_filters),
         )
     }
 
@@ -896,6 +1232,10 @@ impl From<&CompactionPlanningConfig> for PlanStrategy {
 
             CompactionPlanningConfig::FilesWithDeletes(deletes_config) => {
                 PlanStrategy::from_files_with_deletes(deletes_config)
+            }
+
+            CompactionPlanningConfig::SmallFilesWithDelete(config) => {
+                PlanStrategy::from_small_files_with_delete(config)
             }
         }
     }
@@ -1140,16 +1480,17 @@ mod tests {
             }
         }
 
-        /// Create a test delete file with given path and type
-        pub fn create_delete_file(
+        /// Create a test delete file with given path, type, and record count.
+        pub fn create_delete_file_with_record_count(
             path: String,
             content_type: iceberg::spec::DataContentType,
+            record_count: u64,
         ) -> Arc<FileScanTask> {
             use iceberg::spec::DataFileFormat;
             Arc::new(FileScanTask {
                 start: 0,
                 length: 1024,
-                record_count: Some(10),
+                record_count: Some(record_count),
                 data_file_path: path,
                 referenced_data_file: None,
                 data_file_content: content_type,
@@ -1160,6 +1501,46 @@ mod tests {
                 deletes: vec![],
                 sequence_number: 1,
                 equality_ids: Some(vec![1, 2]),
+                file_size_in_bytes: 1024,
+                partition: None,
+                partition_spec: None,
+                name_mapping: None,
+                case_sensitive: true,
+            })
+        }
+
+        /// Create a test delete file with given path and type, with a default record count.
+        pub fn create_delete_file(
+            path: String,
+            content_type: iceberg::spec::DataContentType,
+        ) -> Arc<FileScanTask> {
+            Self::create_delete_file_with_record_count(path, content_type, 10)
+        }
+
+        /// Create a test position-delete file with an explicit record count,
+        /// optionally scoped to a specific data file via `referenced_data_file`.
+        /// `None` simulates a partition-scoped position delete not attributable
+        /// to a single data file.
+        pub fn create_position_delete_file(
+            path: String,
+            record_count: u64,
+            referenced_data_file: Option<String>,
+        ) -> Arc<FileScanTask> {
+            use iceberg::spec::{DataContentType, DataFileFormat};
+            Arc::new(FileScanTask {
+                start: 0,
+                length: 1024,
+                record_count: Some(record_count),
+                data_file_path: path,
+                referenced_data_file,
+                data_file_content: DataContentType::PositionDeletes,
+                data_file_format: DataFileFormat::Parquet,
+                schema: get_test_schema(),
+                project_field_ids: vec![1],
+                predicate: None,
+                deletes: vec![],
+                sequence_number: 1,
+                equality_ids: None,
                 file_size_in_bytes: 1024,
                 partition: None,
                 partition_spec: None,
@@ -1319,6 +1700,22 @@ mod tests {
         // Should have different description than the other two
         assert_ne!(deletes_desc, small_files_desc);
         assert_ne!(deletes_desc, full_desc);
+
+        // Verify SmallFilesWithDelete config
+        let combined_config = CompactionPlanningConfig::SmallFilesWithDelete(
+            crate::config::SmallFilesWithDeleteConfig::default(),
+        );
+        let combined_strategy = PlanStrategy::from(&combined_config);
+        let combined_desc = combined_strategy.to_string();
+
+        assert!(combined_desc.contains("Or["));
+        assert!(combined_desc.contains("SizeFilter"));
+        assert!(combined_desc.contains("DeleteFileCountFilter"));
+
+        // Should have different description than all other strategies
+        assert_ne!(combined_desc, small_files_desc);
+        assert_ne!(combined_desc, full_desc);
+        assert_ne!(combined_desc, deletes_desc);
     }
 
     #[test]
@@ -2428,6 +2825,541 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].data_file_path, "two_deletes.parquet");
         assert_eq!(result[0].deletes.len(), 2);
+    }
+
+    #[test]
+    fn test_position_delete_record_count_filter_strategy() {
+        let strategy = PositionDeleteRecordCountFilterStrategy::new(50);
+        assert_eq!(
+            strategy.to_string(),
+            "PositionDeleteRecordCountFilter[>=50 records]"
+        );
+
+        // File-scoped position delete (referenced_data_file set) counts towards the total.
+        let mut file_scoped = TestFileBuilder::new("file_scoped.parquet")
+            .size(10 * 1024 * 1024)
+            .build();
+        file_scoped
+            .deletes
+            .push(TestUtils::create_position_delete_file(
+                "pos_delete_1.parquet".to_owned(),
+                60,
+                Some("file_scoped.parquet".to_owned()),
+            ));
+        assert_eq!(
+            strategy.filter(vec![file_scoped.clone()]).len(),
+            1,
+            "file-scoped position delete should count towards the approximate row count"
+        );
+
+        // Partition-scoped position delete (no referenced_data_file) is excluded.
+        let mut partition_scoped = TestFileBuilder::new("partition_scoped.parquet")
+            .size(10 * 1024 * 1024)
+            .build();
+        partition_scoped
+            .deletes
+            .push(TestUtils::create_position_delete_file(
+                "pos_delete_2.parquet".to_owned(),
+                60,
+                None,
+            ));
+        assert_eq!(
+            strategy.filter(vec![partition_scoped]).len(),
+            0,
+            "partition-scoped position delete must not count towards the approximate row count"
+        );
+
+        // Equality deletes are always excluded, regardless of record count.
+        let equality_only = TestUtils::add_delete_files(
+            TestFileBuilder::new("equality_only.parquet")
+                .size(10 * 1024 * 1024)
+                .build(),
+            5,
+        );
+        assert_eq!(
+            strategy.filter(vec![equality_only]).len(),
+            0,
+            "equality deletes must not count towards the approximate row count"
+        );
+
+        // Known deleted record count is clamped to the data file's own record count.
+        let mut clamped = TestFileBuilder::new("clamped.parquet")
+            .size(10 * 1024 * 1024)
+            .build();
+        clamped.record_count = Some(40);
+        clamped.deletes.push(TestUtils::create_position_delete_file(
+            "pos_delete_3.parquet".to_owned(),
+            1000,
+            Some("clamped.parquet".to_owned()),
+        ));
+        // Without clamping this would pass a >=500 threshold; clamped to 40 it should not.
+        let high_threshold_strategy = PositionDeleteRecordCountFilterStrategy::new(500);
+        assert_eq!(
+            high_threshold_strategy.filter(vec![clamped]).len(),
+            0,
+            "approximate row count must be clamped to the data file's own record count"
+        );
+    }
+
+    #[test]
+    fn test_equality_delete_record_count_filter_strategy() {
+        let strategy = EqualityDeleteRecordCountFilterStrategy::new(100_000);
+        assert_eq!(
+            strategy.to_string(),
+            "EqualityDeleteRecordCountFilter[>=100000 records]"
+        );
+
+        // Equality-delete record counts accumulate across multiple delete files.
+        let mut heavy = TestFileBuilder::new("heavy.parquet")
+            .size(10 * 1024 * 1024)
+            .build();
+        heavy
+            .deletes
+            .push(TestUtils::create_delete_file_with_record_count(
+                "eq_1.parquet".to_owned(),
+                iceberg::spec::DataContentType::EqualityDeletes,
+                60_000,
+            ));
+        heavy
+            .deletes
+            .push(TestUtils::create_delete_file_with_record_count(
+                "eq_2.parquet".to_owned(),
+                iceberg::spec::DataContentType::EqualityDeletes,
+                40_000,
+            ));
+        assert_eq!(
+            strategy.filter(vec![heavy]).len(),
+            1,
+            "accumulated equality-delete record count should meet the threshold"
+        );
+
+        // Not clamped to the data file's own record count: exposure from a
+        // shared equality-delete file can exceed the file's row count.
+        let mut small_file_large_exposure = TestFileBuilder::new("small_file.parquet")
+            .size(1024)
+            .build();
+        small_file_large_exposure.record_count = Some(10);
+        small_file_large_exposure
+            .deletes
+            .push(TestUtils::create_delete_file_with_record_count(
+                "eq_shared.parquet".to_owned(),
+                iceberg::spec::DataContentType::EqualityDeletes,
+                200_000,
+            ));
+        assert_eq!(
+            strategy.filter(vec![small_file_large_exposure]).len(),
+            1,
+            "equality-delete record count must not be clamped to the data file's own record count"
+        );
+
+        // Position deletes (file- or partition-scoped) don't count towards this predicate.
+        let mut position_only = TestFileBuilder::new("position_only.parquet")
+            .size(10 * 1024 * 1024)
+            .build();
+        position_only
+            .deletes
+            .push(TestUtils::create_position_delete_file(
+                "pos_delete.parquet".to_owned(),
+                200_000,
+                Some("position_only.parquet".to_owned()),
+            ));
+        assert_eq!(
+            strategy.filter(vec![position_only]).len(),
+            0,
+            "position deletes must not count towards the equality-delete record count"
+        );
+
+        // Below threshold: not selected.
+        let mut light = TestFileBuilder::new("light.parquet")
+            .size(10 * 1024 * 1024)
+            .build();
+        light
+            .deletes
+            .push(TestUtils::create_delete_file_with_record_count(
+                "eq_small.parquet".to_owned(),
+                iceberg::spec::DataContentType::EqualityDeletes,
+                10,
+            ));
+        assert_eq!(strategy.filter(vec![light]).len(), 0);
+    }
+
+    #[test]
+    fn test_files_with_deletes_strategy_equality_delete_record_count_threshold() {
+        use crate::config::FilesWithDeletesConfigBuilder;
+
+        // Only the equality-delete record-count predicate is configured.
+        let config = FilesWithDeletesConfigBuilder::default()
+            .min_delete_file_count_threshold(0_usize)
+            .min_equality_delete_record_count_threshold(100_000_u64)
+            .build()
+            .unwrap();
+        let strategy = PlanStrategy::from(&CompactionPlanningConfig::FilesWithDeletes(config));
+        assert!(
+            strategy
+                .to_string()
+                .contains("EqualityDeleteRecordCountFilter")
+        );
+        assert!(!strategy.to_string().contains("DeleteFileCountFilter"));
+
+        let mut selected = TestFileBuilder::new("selected.parquet")
+            .size(10 * 1024 * 1024)
+            .build();
+        selected
+            .deletes
+            .push(TestUtils::create_delete_file_with_record_count(
+                "eq_big.parquet".to_owned(),
+                iceberg::spec::DataContentType::EqualityDeletes,
+                150_000,
+            ));
+
+        let not_selected = TestFileBuilder::new("not_selected.parquet")
+            .size(10 * 1024 * 1024)
+            .build();
+
+        let result = TestUtils::execute_strategy_flat(&strategy, vec![selected, not_selected]);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].data_file_path, "selected.parquet");
+
+        // All three thresholds configured: a file matching ANY is selected (logical OR).
+        let all_config = FilesWithDeletesConfigBuilder::default()
+            .min_delete_file_count_threshold(3_usize)
+            .min_position_delete_record_count_threshold(1000_u64)
+            .min_equality_delete_record_count_threshold(100_000_u64)
+            .build()
+            .unwrap();
+        let all_strategy =
+            PlanStrategy::from(&CompactionPlanningConfig::FilesWithDeletes(all_config));
+        assert!(all_strategy.to_string().contains("Or["));
+
+        // Matches only the equality-delete record-count predicate.
+        let mut only_equality_heavy = TestFileBuilder::new("only_equality_heavy.parquet")
+            .size(10 * 1024 * 1024)
+            .build();
+        only_equality_heavy
+            .deletes
+            .push(TestUtils::create_delete_file_with_record_count(
+                "eq_huge.parquet".to_owned(),
+                iceberg::spec::DataContentType::EqualityDeletes,
+                200_000,
+            ));
+
+        // Matches none of the predicates.
+        let none = TestFileBuilder::new("none.parquet")
+            .size(10 * 1024 * 1024)
+            .build();
+
+        let result =
+            TestUtils::execute_strategy_flat(&all_strategy, vec![only_equality_heavy, none]);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].data_file_path, "only_equality_heavy.parquet");
+    }
+
+    #[test]
+    fn test_files_with_deletes_strategy_position_delete_record_count_threshold_ored_with_file_count()
+     {
+        use crate::config::FilesWithDeletesConfigBuilder;
+
+        // Only the row-count predicate is configured (file-count check disabled).
+        let config = FilesWithDeletesConfigBuilder::default()
+            .min_delete_file_count_threshold(0_usize)
+            .min_position_delete_record_count_threshold(50_u64)
+            .build()
+            .unwrap();
+        let strategy = PlanStrategy::from(&CompactionPlanningConfig::FilesWithDeletes(config));
+        assert!(
+            strategy
+                .to_string()
+                .contains("PositionDeleteRecordCountFilter")
+        );
+        assert!(!strategy.to_string().contains("DeleteFileCountFilter"));
+
+        let mut selected = TestFileBuilder::new("selected.parquet")
+            .size(10 * 1024 * 1024)
+            .build();
+        selected
+            .deletes
+            .push(TestUtils::create_position_delete_file(
+                "pos_delete.parquet".to_owned(),
+                60,
+                Some("selected.parquet".to_owned()),
+            ));
+
+        let not_selected = TestFileBuilder::new("not_selected.parquet")
+            .size(10 * 1024 * 1024)
+            .build();
+
+        let result = TestUtils::execute_strategy_flat(&strategy, vec![selected, not_selected]);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].data_file_path, "selected.parquet");
+
+        // Both thresholds configured: a file matching EITHER is selected (logical OR),
+        // mirroring Apache Iceberg's tooManyDeletes() || tooHighDeleteRatio().
+        let both_config = FilesWithDeletesConfigBuilder::default()
+            .min_delete_file_count_threshold(3_usize)
+            .min_position_delete_record_count_threshold(1000_u64)
+            .build()
+            .unwrap();
+        let both_strategy =
+            PlanStrategy::from(&CompactionPlanningConfig::FilesWithDeletes(both_config));
+        assert!(both_strategy.to_string().contains("Or["));
+
+        // Matches only the file-count predicate (3 deletes, low row count).
+        let many_small_deletes = TestUtils::add_delete_files(
+            TestFileBuilder::new("many_small_deletes.parquet")
+                .size(10 * 1024 * 1024)
+                .build(),
+            3,
+        );
+        // Matches only the row-count predicate (1 delete, huge row count).
+        // `record_count` is bumped above the default so the delete's own huge
+        // count isn't clamped down to the (unrelated) default of 100.
+        let mut one_big_delete = TestFileBuilder::new("one_big_delete.parquet")
+            .size(10 * 1024 * 1024)
+            .build();
+        one_big_delete.record_count = Some(2000);
+        one_big_delete
+            .deletes
+            .push(TestUtils::create_position_delete_file(
+                "pos_delete_big.parquet".to_owned(),
+                5000,
+                Some("one_big_delete.parquet".to_owned()),
+            ));
+        // Matches neither predicate.
+        let untouched = TestFileBuilder::new("untouched.parquet")
+            .size(10 * 1024 * 1024)
+            .build();
+
+        let mut result = TestUtils::execute_strategy_flat(&both_strategy, vec![
+            many_small_deletes,
+            one_big_delete,
+            untouched,
+        ]);
+        result.sort_by(|a, b| a.data_file_path.cmp(&b.data_file_path));
+        TestUtils::assert_paths_eq(
+            &["many_small_deletes.parquet", "one_big_delete.parquet"],
+            &result,
+        );
+    }
+
+    #[test]
+    fn test_or_filter_strategy() {
+        // Both sub-filters empty (thresholds no file can meet) -> no matches.
+        let strategy = OrFilterStrategy::new(vec![
+            Box::new(SizeFilterStrategy {
+                min_size: None,
+                max_size: Some(0),
+            }),
+            Box::new(DeleteFileCountFilterStrategy::new(usize::MAX)),
+        ]);
+        let test_files = vec![
+            TestFileBuilder::new("small.parquet")
+                .size(1 * 1024 * 1024)
+                .build(),
+        ];
+        assert_eq!(strategy.filter(test_files).len(), 0);
+
+        // Disjoint matches: one file matches only by size, another only by deletes.
+        let strategy = OrFilterStrategy::new(vec![
+            Box::new(SizeFilterStrategy {
+                min_size: None,
+                max_size: Some(20 * 1024 * 1024),
+            }),
+            Box::new(DeleteFileCountFilterStrategy::new(2)),
+        ]);
+        let test_files = vec![
+            TestFileBuilder::new("small_no_deletes.parquet")
+                .size(5 * 1024 * 1024)
+                .build(),
+            TestUtils::add_delete_files(
+                TestFileBuilder::new("large_with_deletes.parquet")
+                    .size(50 * 1024 * 1024)
+                    .build(),
+                2,
+            ),
+            TestFileBuilder::new("large_no_deletes.parquet")
+                .size(50 * 1024 * 1024)
+                .build(),
+        ];
+        let mut result = strategy.filter(test_files);
+        result.sort_by(|a, b| a.data_file_path.cmp(&b.data_file_path));
+        TestUtils::assert_paths_eq(
+            &["large_with_deletes.parquet", "small_no_deletes.parquet"],
+            &result,
+        );
+
+        // Full overlap: a file matching both predicates is deduplicated, not duplicated.
+        let strategy = OrFilterStrategy::new(vec![
+            Box::new(SizeFilterStrategy {
+                min_size: None,
+                max_size: Some(20 * 1024 * 1024),
+            }),
+            Box::new(DeleteFileCountFilterStrategy::new(1)),
+        ]);
+        let test_files = vec![TestUtils::add_delete_files(
+            TestFileBuilder::new("small_with_deletes.parquet")
+                .size(5 * 1024 * 1024)
+                .build(),
+            1,
+        )];
+        let result = strategy.filter(test_files);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].data_file_path, "small_with_deletes.parquet");
+    }
+
+    #[test]
+    fn test_small_files_with_delete_strategy_comprehensive() {
+        use crate::config::SmallFilesWithDeleteConfigBuilder;
+
+        let config = SmallFilesWithDeleteConfigBuilder::default()
+            .small_file_threshold_bytes(20 * 1024 * 1024_u64)
+            .min_delete_file_count_threshold(2_usize)
+            .build()
+            .unwrap();
+        let planning_config = CompactionPlanningConfig::SmallFilesWithDelete(config);
+        let strategy = PlanStrategy::from(&planning_config);
+
+        let desc = strategy.to_string();
+        assert!(desc.contains("SizeFilter"));
+        assert!(desc.contains("DeleteFileCountFilter"));
+
+        let test_files = vec![
+            // Selected: small, no deletes.
+            TestFileBuilder::new("small.parquet")
+                .size(5 * 1024 * 1024)
+                .build(),
+            // Selected: large, but enough deletes.
+            TestUtils::add_delete_files(
+                TestFileBuilder::new("large_with_many_deletes.parquet")
+                    .size(50 * 1024 * 1024)
+                    .build(),
+                2,
+            ),
+            // Not selected: large, and too few deletes.
+            TestUtils::add_delete_files(
+                TestFileBuilder::new("large_with_one_delete.parquet")
+                    .size(50 * 1024 * 1024)
+                    .build(),
+                1,
+            ),
+            // Not selected: large, no deletes.
+            TestFileBuilder::new("large_no_deletes.parquet")
+                .size(50 * 1024 * 1024)
+                .build(),
+        ];
+
+        let mut result = TestUtils::execute_strategy_flat(&strategy, test_files);
+        result.sort_by(|a, b| a.data_file_path.cmp(&b.data_file_path));
+
+        TestUtils::assert_paths_eq(
+            &["large_with_many_deletes.parquet", "small.parquet"],
+            &result,
+        );
+    }
+
+    #[test]
+    fn test_small_files_with_delete_strategy_position_delete_record_count_predicate() {
+        use crate::config::SmallFilesWithDeleteConfigBuilder;
+
+        // Only size and row-count predicates enabled (file-count check disabled).
+        let config = SmallFilesWithDeleteConfigBuilder::default()
+            .small_file_threshold_bytes(20 * 1024 * 1024_u64)
+            .min_delete_file_count_threshold(0_usize)
+            .min_position_delete_record_count_threshold(50_u64)
+            .build()
+            .unwrap();
+        let strategy = PlanStrategy::from(&CompactionPlanningConfig::SmallFilesWithDelete(config));
+
+        let desc = strategy.to_string();
+        assert!(desc.contains("SizeFilter"));
+        assert!(desc.contains("PositionDeleteRecordCountFilter"));
+        assert!(!desc.contains("DeleteFileCountFilter"));
+
+        let mut large_with_many_deleted_rows =
+            TestFileBuilder::new("large_with_many_deleted_rows.parquet")
+                .size(50 * 1024 * 1024)
+                .build();
+        large_with_many_deleted_rows
+            .deletes
+            .push(TestUtils::create_position_delete_file(
+                "pos_delete.parquet".to_owned(),
+                60,
+                Some("large_with_many_deleted_rows.parquet".to_owned()),
+            ));
+
+        let large_no_deletes = TestFileBuilder::new("large_no_deletes.parquet")
+            .size(50 * 1024 * 1024)
+            .build();
+
+        let mut result = TestUtils::execute_strategy_flat(&strategy, vec![
+            large_with_many_deleted_rows,
+            large_no_deletes,
+        ]);
+        result.sort_by(|a, b| a.data_file_path.cmp(&b.data_file_path));
+
+        TestUtils::assert_paths_eq(&["large_with_many_deleted_rows.parquet"], &result);
+    }
+
+    #[test]
+    fn test_small_files_with_delete_group_file_count_exemption() {
+        use crate::config::{GroupFilters, GroupingStrategy, SmallFilesWithDeleteConfigBuilder};
+
+        // min_group_file_count=2, but the delete-triggered group below only
+        // ever has 1 data file. Without the exemption, this group would be
+        // silently dropped and its 20 equality-delete files would never get
+        // cleaned up.
+        let config = SmallFilesWithDeleteConfigBuilder::default()
+            .small_file_threshold_bytes(1_u64) // disable the size predicate
+            .min_delete_file_count_threshold(2_usize)
+            .grouping_strategy(GroupingStrategy::Single)
+            .group_filters(GroupFilters {
+                min_group_size_bytes: None,
+                min_group_file_count: Some(2),
+            })
+            .build()
+            .unwrap();
+        let strategy = PlanStrategy::from(&CompactionPlanningConfig::SmallFilesWithDelete(config));
+
+        let delete_heavy_lone_file = TestUtils::add_delete_files(
+            TestFileBuilder::new("delete_heavy_lone_file.parquet")
+                .size(50 * 1024 * 1024)
+                .build(),
+            20,
+        );
+
+        let result = TestUtils::execute_strategy_flat(&strategy, vec![delete_heavy_lone_file]);
+
+        TestUtils::assert_paths_eq(&["delete_heavy_lone_file.parquet"], &result);
+    }
+
+    #[test]
+    fn test_small_files_with_delete_group_file_count_still_applies_without_deletes() {
+        use crate::config::{GroupFilters, GroupingStrategy, SmallFilesWithDeleteConfigBuilder};
+
+        // Control case: a lone small file with no deletes at all must still be
+        // rejected by min_group_file_count. The exemption must not leak into
+        // groups that never matched a delete predicate.
+        let config = SmallFilesWithDeleteConfigBuilder::default()
+            .small_file_threshold_bytes(20 * 1024 * 1024_u64)
+            .min_delete_file_count_threshold(2_usize)
+            .grouping_strategy(GroupingStrategy::Single)
+            .group_filters(GroupFilters {
+                min_group_size_bytes: None,
+                min_group_file_count: Some(2),
+            })
+            .build()
+            .unwrap();
+        let strategy = PlanStrategy::from(&CompactionPlanningConfig::SmallFilesWithDelete(config));
+
+        let lone_small_file = TestFileBuilder::new("lone_small_file.parquet")
+            .size(5 * 1024 * 1024)
+            .build();
+
+        let result = TestUtils::execute_strategy_flat(&strategy, vec![lone_small_file]);
+
+        assert!(
+            result.is_empty(),
+            "lone small file without deletes should still be rejected by min_group_file_count"
+        );
     }
 
     #[test]

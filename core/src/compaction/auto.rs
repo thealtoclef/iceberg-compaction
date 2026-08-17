@@ -51,7 +51,9 @@ impl AutoSelectedStrategy {
             crate::config::CompactionPlanningConfig::SmallFiles(_) => {
                 Some(AutoSelectedStrategy::SmallFiles)
             }
-            crate::config::CompactionPlanningConfig::Full(_) => None,
+            // Not yet produced by auto strategy selection; only reachable via explicit config.
+            crate::config::CompactionPlanningConfig::Full(_)
+            | crate::config::CompactionPlanningConfig::SmallFilesWithDelete(_) => None,
         }
     }
 }
@@ -145,6 +147,8 @@ impl AutoCompactionPlanner {
             tasks.as_ref().unwrap(),
             self.config.small_file_threshold_bytes,
             self.config.min_delete_file_count_threshold,
+            self.config.min_position_delete_record_count_threshold,
+            self.config.min_equality_delete_record_count_threshold,
         );
 
         let delete_candidate = self.config.files_with_deletes_candidate(&stats);
@@ -295,11 +299,25 @@ impl AutoCompactionPlanner {
     }
 
     /// Computes statistics from pre-scanned tasks without additional IO.
+    ///
+    /// A task counts as delete-heavy if it meets *any* of the three
+    /// delete-based thresholds (file count, approximate position-delete row
+    /// count, or accumulated equality-delete record count) — mirroring the
+    /// logical-OR combination `PlanStrategy::delete_predicate_filters` uses
+    /// once a `FilesWithDeletes`/`SmallFilesWithDelete` plan is selected, so
+    /// row-count/equality-count-only configurations can also trigger
+    /// auto-selection instead of being silently inert.
     fn compute_stats(
         tasks: &[FileScanTask],
         small_file_threshold_bytes: u64,
         min_delete_file_count_threshold: usize,
+        min_position_delete_record_count_threshold: Option<u64>,
+        min_equality_delete_record_count_threshold: Option<u64>,
     ) -> SnapshotStats {
+        use crate::file_selection::strategy::{
+            EqualityDeleteRecordCountFilterStrategy, PositionDeleteRecordCountFilterStrategy,
+        };
+
         let mut stats = SnapshotStats::default();
 
         for task in tasks {
@@ -310,8 +328,19 @@ impl AutoCompactionPlanner {
                 stats.small_files_count += 1;
             }
 
-            let is_delete_heavy = min_delete_file_count_threshold > 0
-                && task.deletes.len() >= min_delete_file_count_threshold;
+            let is_delete_heavy = (min_delete_file_count_threshold > 0
+                && task.deletes.len() >= min_delete_file_count_threshold)
+                || min_position_delete_record_count_threshold.is_some_and(|threshold| {
+                    threshold > 0
+                        && PositionDeleteRecordCountFilterStrategy::approx_deleted_row_count(task)
+                            >= threshold
+                })
+                || min_equality_delete_record_count_threshold.is_some_and(|threshold| {
+                    threshold > 0
+                        && EqualityDeleteRecordCountFilterStrategy::equality_delete_record_count(
+                            task,
+                        ) >= threshold
+                });
             if is_delete_heavy {
                 stats.delete_heavy_files_count += 1;
             }
